@@ -3,7 +3,7 @@ import escapeHtml from 'escape-html';
 import { PlayerEvent } from 'apps/stable/features/playback/constants/playerEvent';
 import { AppFeature } from 'constants/appFeature';
 import { TICKS_PER_MINUTE, TICKS_PER_SECOND } from 'constants/time';
-import { EventType } from 'types/eventType';
+import { EventType } from 'constants/eventType';
 
 import { playbackManager } from '../../../components/playback/playbackmanager';
 import browser from '../../../scripts/browser';
@@ -1616,7 +1616,7 @@ export default function (view) {
         const offsetY = -(tileOffsetY * trickplayInfo.Height);
 
         const imgSrc = apiClient.getUrl('Videos/' + item.Id + '/Trickplay/' + trickplayInfo.Width + '/' + index + '.jpg', {
-            api_key: apiClient.accessToken(),
+            ApiKey: apiClient.accessToken(),
             MediaSourceId: mediaSourceId
         });
 

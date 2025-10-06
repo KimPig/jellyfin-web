@@ -3,7 +3,7 @@ import escapeHtml from 'escape-html';
 import { PlayerEvent } from 'apps/stable/features/playback/constants/playerEvent';
 import { AppFeature } from 'constants/appFeature';
 import { TICKS_PER_MINUTE, TICKS_PER_SECOND } from 'constants/time';
-import { EventType } from 'constants/eventType';
+import { EventType } from 'types/eventType';
 
 import { playbackManager } from '../../../components/playback/playbackmanager';
 import browser from '../../../scripts/browser';
@@ -1214,6 +1214,16 @@ export default function (view) {
         }
     }
 
+    let spaceKeyTimeout;
+    let isSpaceKeyDown = false;
+    let isSpaceKeyHeld = false;
+	let mouseHoldTimeout;
+	let isMouseDown = false;
+	let isMouseHeld = false;
+	let originalPlaybackRate = 1;
+	let activePointerType = '';
+	let fastForwardIndicatorElem = null;
+	
     function onKeyDown(e) {
         clickedElement = e.target;
 
@@ -1228,8 +1238,19 @@ export default function (view) {
 
         if (e.keyCode === 32) {
             if (e.target.tagName !== 'BUTTON' || !layoutManager.tv) {
-                playbackManager.playPause(currentPlayer);
-                showOsd(btnPlayPause);
+                if (!isSpaceKeyDown) {
+                    isSpaceKeyDown = true;
+                    isSpaceKeyHeld = false;
+					
+					originalPlaybackRate = playbackManager.getPlaybackRate(currentPlayer) || 1;
+					 
+                    spaceKeyTimeout = setTimeout(() => {
+                        isSpaceKeyHeld = true;
+                        playbackManager.setPlaybackRate(2, currentPlayer);
+						showFastForwardIndicator();
+                    }, 500);
+                }
+
                 e.preventDefault();
                 e.stopPropagation();
                 // Trick Firefox with a null element to skip next click
@@ -1430,6 +1451,28 @@ export default function (view) {
         }
     }
 
+    function onKeyUp(e) {
+        if (e.keyCode === 32) {
+            if (isSpaceKeyDown) {
+				hideFastForwardIndicator();
+                if (isSpaceKeyHeld) {
+                    playbackManager.setPlaybackRate(originalPlaybackRate, currentPlayer);
+                } else {
+                    playbackManager.playPause(currentPlayer);
+                    showOsd(osdBottomElement.querySelector('.btnPause'));
+                }
+
+                if (spaceKeyTimeout) {
+                    clearTimeout(spaceKeyTimeout);
+                    spaceKeyTimeout = null;
+                }
+
+                isSpaceKeyDown = false;
+                isSpaceKeyHeld = false;
+            }
+        }
+    }
+
     function onKeyDownCapture() {
         resetIdle();
     }
@@ -1444,6 +1487,35 @@ export default function (view) {
         }
     }
 
+	/**
+     * '2x >>' 표시 요소를 생성하고 기본 클래스를 부여하는 함수.
+     * 스타일링은 Custom CSS에서 담당합니다.
+     */
+    function createFastForwardIndicator() {
+        if (fastForwardIndicatorElem) {
+            return;
+        }
+        
+        const indicator = document.createElement('div');
+        indicator.className = 'ff-indicator';
+        
+        view.appendChild(indicator);
+        fastForwardIndicatorElem = indicator;
+    }
+
+    function showFastForwardIndicator() {
+        createFastForwardIndicator();
+        if (fastForwardIndicatorElem) {
+            fastForwardIndicatorElem.classList.add('visible');
+        }
+    }
+
+    function hideFastForwardIndicator() {
+        if (fastForwardIndicatorElem) {
+            fastForwardIndicatorElem.classList.remove('visible');
+        }
+    }
+	
     function onWindowMouseDown(e) {
         clickedElement = e.target;
         mouseIsDown = true;
@@ -1452,6 +1524,27 @@ export default function (view) {
 
     function onWindowMouseUp() {
         mouseIsDown = false;
+        if (isMouseDown) {
+            if (isMouseHeld) {
+				hideFastForwardIndicator();
+                playbackManager.setPlaybackRate(originalPlaybackRate, currentPlayer);
+            } else {
+                if (activePointerType === 'touch') {
+					lastPointerDown = new Date().getTime();
+                    toggleOsd();
+                } else {
+                    playbackManager.playPause(currentPlayer);
+                    showOsd();
+                }
+			}
+            if (mouseHoldTimeout) {
+                clearTimeout(mouseHoldTimeout);
+                mouseHoldTimeout = null;
+            }
+            isMouseDown = false;
+            isMouseHeld = false;
+        }
+
         resetIdle();
     }
 
@@ -1523,7 +1616,7 @@ export default function (view) {
         const offsetY = -(tileOffsetY * trickplayInfo.Height);
 
         const imgSrc = apiClient.getUrl('Videos/' + item.Id + '/Trickplay/' + trickplayInfo.Width + '/' + index + '.jpg', {
-            ApiKey: apiClient.accessToken(),
+            api_key: apiClient.accessToken(),
             MediaSourceId: mediaSourceId
         });
 
@@ -1680,6 +1773,7 @@ export default function (view) {
             showOsd();
             inputManager.on(window, onInputCommand);
             document.addEventListener('keydown', onKeyDown);
+            document.addEventListener('keyup', onKeyUp);
             dom.addEventListener(document, 'keydown', onKeyDownCapture, {
                 capture: true,
                 passive: true
@@ -1723,6 +1817,7 @@ export default function (view) {
         }
 
         document.removeEventListener('keydown', onKeyDown);
+        document.removeEventListener('keyup', onKeyUp);
         dom.removeEventListener(document, 'keydown', onKeyDownCapture, {
             capture: true,
             passive: true
@@ -1806,27 +1901,41 @@ export default function (view) {
 
         switch (pointerType) {
             case 'touch':
-                if (now - lastPointerDown > 300) {
-                    lastPointerDown = now;
-                    toggleOsd();
+                if (now - lastPointerDown < 300) {
+                    break;
                 }
+                
+                if (!isMouseDown) {
+                    isMouseDown = true;
+                    isMouseHeld = false;
+                    activePointerType = 'touch';
 
+                    originalPlaybackRate = playbackManager.getPlaybackRate(currentPlayer) || 1;
+
+                    mouseHoldTimeout = setTimeout(() => {
+                        isMouseHeld = true;
+                        playbackManager.setPlaybackRate(2, currentPlayer);
+						showFastForwardIndicator();
+                    }, 500);
+                }
                 break;
 
             case 'mouse':
-                if (!e.button) {
-                    if (playPauseClickTimeout) {
-                        clearTimeout(playPauseClickTimeout);
-                        playPauseClickTimeout = 0;
-                    } else {
-                        playPauseClickTimeout = setTimeout(function() {
-                            playbackManager.playPause(currentPlayer);
-                            showOsd();
-                            playPauseClickTimeout = 0;
-                        }, 300);
+                if (e.button === 0) {
+                    if (!isMouseDown) {
+                        isMouseDown = true;
+                        isMouseHeld = false;
+						activePointerType = 'mouse';
+
+						originalPlaybackRate = playbackManager.getPlaybackRate(currentPlayer) || 1;
+						
+                        mouseHoldTimeout = setTimeout(() => {
+                            isMouseHeld = true;
+                            playbackManager.setPlaybackRate(2, currentPlayer);
+							showFastForwardIndicator();
+                        }, 500);
                     }
                 }
-
                 break;
 
             default:

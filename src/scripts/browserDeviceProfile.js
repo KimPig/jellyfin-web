@@ -217,8 +217,8 @@ function testCanPlayMkv(videoTestElement) {
             || videoTestElement.canPlayType('video/mkv').replace(/no/, '')) {
         return true;
     }
-
-    if (browser.edgeChromium && browser.windows) {
+	
+    if (browser.chrome || browser.edgeChromium || browser.opera) {
         return true;
     }
 
@@ -559,28 +559,22 @@ export default function (options) {
     // For AC3/EAC3 remuxing.
     // Do not use AC3 for audio transcoding unless AAC and MP3 are not supported.
     if (canPlayAc3VideoAudio) {
-        videoAudioCodecs.push('ac3');
-        if (browser.edgeChromium) {
-            hlsInFmp4VideoAudioCodecs.push('ac3');
-        }
-
+    videoAudioCodecs.push('ac3');
+    hlsInFmp4VideoAudioCodecs.push('ac3'); 
+    
+    if (canPlayEac3VideoAudio) {
+        videoAudioCodecs.push('eac3');
+        hlsInFmp4VideoAudioCodecs.push('eac3');
+    }
+    
+    if (canPlayAc3VideoAudioInHls) {
+        hlsInTsVideoAudioCodecs.push('ac3');
+        
         if (canPlayEac3VideoAudio) {
-            videoAudioCodecs.push('eac3');
-            if (browser.edgeChromium) {
-                hlsInFmp4VideoAudioCodecs.push('eac3');
-            }
-        }
-
-        if (canPlayAc3VideoAudioInHls) {
-            hlsInTsVideoAudioCodecs.push('ac3');
-            hlsInFmp4VideoAudioCodecs.push('ac3');
-
-            if (canPlayEac3VideoAudio) {
-                hlsInTsVideoAudioCodecs.push('eac3');
-                hlsInFmp4VideoAudioCodecs.push('eac3');
-            }
+            hlsInTsVideoAudioCodecs.push('eac3');
         }
     }
+}
 
     if (supportsMp2VideoAudio) {
         videoAudioCodecs.push('mp2');
@@ -648,34 +642,35 @@ export default function (options) {
     });
 
     const mp4VideoCodecs = [];
-    const webmVideoCodecs = [];
-    const hlsInTsVideoCodecs = [];
-    const hlsInFmp4VideoCodecs = [];
+	const webmVideoCodecs = [];
+	const hlsInTsVideoCodecs = [];
+	const hlsInFmp4VideoCodecs = [];
 
-    if (canPlayAv1(videoTestElement)
-        && (browser.safari || (!browser.mobile && (browser.edgeChromium || browser.firefox || browser.chrome || browser.opera)))) {
-        // disable av1 on non-safari mobile browsers since it can be very slow software decoding
-        hlsInFmp4VideoCodecs.push('av1');
-    }
+	if (canPlayH264(videoTestElement)) {
+		mp4VideoCodecs.push('h264');
+		hlsInTsVideoCodecs.push('h264');
+		hlsInFmp4VideoCodecs.push('h264');
+	}
 
-    if (canPlayHevc(videoTestElement, options)
-        && (browser.edgeChromium || browser.safari || browser.tizen || browser.web0s || (browser.chrome && (!browser.android || browser.versionMajor >= 105)) || (browser.opera && !browser.mobile) || (browser.firefox && browser.versionMajor >= 134))) {
-        // Chromium used to support HEVC on Android but not via MSE
-        hlsInFmp4VideoCodecs.push('hevc');
-    }
+	if (canPlayHevc(videoTestElement, options)) {
+		mp4VideoCodecs.push('hevc');
+    
+		if (!browser.tizen && !browser.web0s) {
+			hlsInFmp4VideoCodecs.push('hevc');
+		}
+    
+		if (browser.tizen || browser.web0s || browser.safari || browser.vidaa) {
+			hlsInTsVideoCodecs.push('hevc');
+		}
+	}
 
-    if (canPlayH264(videoTestElement)) {
-        mp4VideoCodecs.push('h264');
-        hlsInTsVideoCodecs.push('h264');
-        hlsInFmp4VideoCodecs.push('h264');
-    }
-
-    if (canPlayHevc(videoTestElement, options)) {
-        mp4VideoCodecs.push('hevc');
-        if (browser.tizen || browser.web0s || browser.vidaa) {
-            hlsInTsVideoCodecs.push('hevc');
-        }
-    }
+	if (canPlayAv1(videoTestElement)) {
+		mp4VideoCodecs.push('av1');
+    
+		if (browser.safari || (!browser.mobile && (browser.chrome || browser.edgeChromium || browser.firefox || browser.opera))) {
+			hlsInFmp4VideoCodecs.push('av1');
+		}
+	}
 
     if (supportsMpeg2Video()) {
         mp4VideoCodecs.push('mpeg2video');
@@ -694,35 +689,24 @@ export default function (options) {
     }
 
     if (canPlayVp9) {
-        if (!browser.iOS && !(browser.firefox && browser.osx)) {
-            // iOS safari may fail to direct play vp9 in mp4 container
-            //
-            // Firefox can play vp9 in mp4 container but fails to detect HDR. Since HDR is
-            // unsupported for all other non-Mac platforms, it's fine to allow vp9 in mp4 for them.
-            //   * https://bugzilla.mozilla.org/show_bug.cgi?id=1915265
-            mp4VideoCodecs.push('vp9');
-        }
-        // Only iOS Safari's native HLS player understands vp9 in fmp4
-        // This should be used in conjunction with forcing
-        // using HLS.js for VP9 remuxing on desktop Safari.
-        if (browser.safari || browser.edgeChromium || browser.chrome || browser.firefox) {
-            hlsInFmp4VideoCodecs.push('vp9');
-        }
-        // webm support is unreliable on safari 17
-        if (!browser.safari
-             || (browser.safari && browser.versionMajor >= 15 && browser.versionMajor < 17)) {
-            webmVideoCodecs.push('vp9');
-        }
+    if (!browser.iOS) {
+        mp4VideoCodecs.push('vp9');
     }
+    
+    if (browser.safari || browser.edgeChromium || browser.chrome || browser.firefox) {
+        hlsInFmp4VideoCodecs.push('vp9');
+    }
+    
+    if (!browser.safari || (browser.safari && browser.versionMajor >= 15 && browser.versionMajor < 17)) {
+        webmVideoCodecs.push('vp9');
+    }
+}
 
     if (canPlayAv1(videoTestElement)) {
-        mp4VideoCodecs.push('av1');
-        // webm support is unreliable on safari 17
-        if (!browser.safari
-             || (browser.safari && browser.versionMajor >= 15 && browser.versionMajor < 17)) {
-            webmVideoCodecs.push('av1');
-        }
+    if (!browser.safari || (browser.safari && browser.versionMajor >= 15 && browser.versionMajor < 17)) {
+        webmVideoCodecs.push('av1');
     }
+}
 
     if ((!browser.safari && canPlayVp8) || browser.tizen) {
         videoAudioCodecs.push('vorbis');
@@ -871,7 +855,7 @@ export default function (options) {
         });
     });
 
-    if (canPlayHls() && options.enableHls !== false) {
+     if (canPlayHls() && options.enableHls !== false) {
         const enableLimitedSegmentLength = userSettings.limitSegmentLength();
         if (hlsInFmp4VideoCodecs.length && hlsInFmp4VideoAudioCodecs.length && enableFmp4Hls) {
             // HACK: Since there is no filter for TS/MP4 in the API, specify HLS support in general and rely on retry after DirectPlay error
@@ -920,7 +904,7 @@ export default function (options) {
                 SegmentLength: enableLimitedSegmentLength ? 1 : undefined
             });
         }
-    }
+    } 
 
     profile.ContainerProfiles = [];
 
@@ -1263,12 +1247,12 @@ export default function (options) {
             Value: hevcVideoRangeTypes,
             IsRequired: false
         },
-        {
-            Condition: 'LessThanEqual',
-            Property: 'VideoLevel',
-            Value: maxHevcLevel.toString(),
-            IsRequired: false
-        }
+        //{
+        //    Condition: 'LessThanEqual',
+        //    Property: 'VideoLevel',
+        //    Value: maxHevcLevel.toString(),
+        //    IsRequired: false
+        //}
     ];
 
     const vp9CodecProfileConditions = [

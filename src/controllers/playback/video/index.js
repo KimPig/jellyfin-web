@@ -272,6 +272,7 @@ export default function (view) {
     let mouseIsDown = false;
 
     function showOsd(focusElement) {
+		if (isSpeedHoldMode) return;
         Events.trigger(document, EventType.SHOW_VIDEO_OSD, [ true ]);
         slideDownToShow(headerElement);
         showMainOsdControls(focusElement);
@@ -386,6 +387,7 @@ export default function (view) {
     }
 
     function onPointerMove(e) {
+		if (isSpeedHoldMode || mouseIsDown) return;
         if ((e.pointerType || (layoutManager.mobile ? 'touch' : 'mouse')) === 'mouse') {
             const eventX = e.screenX || e.clientX || 0;
             const eventY = e.screenY || e.clientY || 0;
@@ -1223,6 +1225,7 @@ export default function (view) {
 	let originalPlaybackRate = 1;
 	let activePointerType = '';
 	let fastForwardIndicatorElem = null;
+	let isSpeedHoldMode = false;
 	
     function onKeyDown(e) {
         clickedElement = e.target;
@@ -1247,6 +1250,9 @@ export default function (view) {
                     spaceKeyTimeout = setTimeout(() => {
                         isSpaceKeyHeld = true;
                         playbackManager.setPlaybackRate(2, currentPlayer);
+						isSpeedHoldMode = true;
+						hideOsd();
+						stopOsdHideTimer();
 						showFastForwardIndicator();
                     }, 500);
                 }
@@ -1461,7 +1467,8 @@ export default function (view) {
                     playbackManager.playPause(currentPlayer);
                     showOsd(osdBottomElement.querySelector('.btnPause'));
                 }
-
+				isSpeedHoldMode = false;
+				
                 if (spaceKeyTimeout) {
                     clearTimeout(spaceKeyTimeout);
                     spaceKeyTimeout = null;
@@ -1474,6 +1481,8 @@ export default function (view) {
     }
 
     function onKeyDownCapture() {
+		if (isSpeedHoldMode) return;     
+		if (e.keyCode === 32 && isSpaceKeyDown) return;
         resetIdle();
     }
 
@@ -1537,6 +1546,8 @@ export default function (view) {
                     showOsd();
                 }
 			}
+			isSpeedHoldMode = false;
+			
             if (mouseHoldTimeout) {
                 clearTimeout(mouseHoldTimeout);
                 mouseHoldTimeout = null;
@@ -1915,6 +1926,9 @@ export default function (view) {
                     mouseHoldTimeout = setTimeout(() => {
                         isMouseHeld = true;
                         playbackManager.setPlaybackRate(2, currentPlayer);
+						isSpeedHoldMode = true;
+						hideOsd();
+						stopOsdHideTimer();
 						showFastForwardIndicator();
                     }, 500);
                 }
@@ -1932,6 +1946,9 @@ export default function (view) {
                         mouseHoldTimeout = setTimeout(() => {
                             isMouseHeld = true;
                             playbackManager.setPlaybackRate(2, currentPlayer);
+							isSpeedHoldMode = true;
+							hideOsd();
+							stopOsdHideTimer();
 							showFastForwardIndicator();
                         }, 500);
                     }

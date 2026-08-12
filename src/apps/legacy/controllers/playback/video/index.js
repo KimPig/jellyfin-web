@@ -268,8 +268,19 @@ export default function (view) {
     }
 
     let mouseIsDown = false;
+    let speedHoldTimeout;
+    let speedHoldSource;
+    let speedHoldPointerType;
+    let speedHoldPointerId;
+    let speedHoldPlayer;
+    let speedHoldOriginalPlaybackRate = 1;
+    let isSpeedHoldMode = false;
+    let isSpaceKeyDown = false;
+    let fastForwardIndicatorElem;
 
     function showOsd(focusElement) {
+        if (isSpeedHoldMode) return;
+
         Events.trigger(document, EventType.SHOW_VIDEO_OSD, [ true ]);
         slideDownToShow(headerElement);
         showMainOsdControls(focusElement);
@@ -384,6 +395,8 @@ export default function (view) {
     }
 
     function onPointerMove(e) {
+        if (isSpeedHoldMode || mouseIsDown) return;
+
         if ((e.pointerType || (layoutManager.mobile ? 'touch' : 'mouse')) === 'mouse') {
             const eventX = e.screenX || e.clientX || 0;
             const eventY = e.screenY || e.clientY || 0;
@@ -607,6 +620,7 @@ export default function (view) {
     }
 
     function releaseCurrentPlayer() {
+        cancelSpeedHold();
         destroyStats();
         destroySubtitleSync();
         resetUpNextDialog();
@@ -1214,6 +1228,122 @@ export default function (view) {
         }
     }
 
+    function supportsSpeedHold() {
+        return playbackManager.getSupportedPlaybackRates(currentPlayer)
+            .some(rate => Number(rate.id) === 2);
+    }
+
+    function createFastForwardIndicator() {
+        if (fastForwardIndicatorElem) return;
+
+        const indicator = document.createElement('div');
+        indicator.className = 'ff-indicator';
+        indicator.setAttribute('role', 'status');
+        indicator.setAttribute('aria-live', 'polite');
+        indicator.setAttribute('aria-label', '2× playback speed');
+
+        const icon = document.createElement('span');
+        icon.className = 'material-icons fast_forward';
+
+        const label = document.createElement('span');
+        label.className = 'ff-indicator-label';
+        label.textContent = '2×';
+
+        indicator.appendChild(icon);
+        indicator.appendChild(label);
+        view.appendChild(indicator);
+        fastForwardIndicatorElem = indicator;
+    }
+
+    function showFastForwardIndicator() {
+        createFastForwardIndicator();
+        fastForwardIndicatorElem.classList.add('visible');
+    }
+
+    function hideFastForwardIndicator() {
+        fastForwardIndicatorElem?.classList.remove('visible');
+    }
+
+    function beginSpeedHold(source, pointerType, pointerId) {
+        if (speedHoldSource || !supportsSpeedHold()) return false;
+
+        const playbackRate = Number(playbackManager.getPlaybackRate(currentPlayer));
+        speedHoldSource = source;
+        speedHoldPointerType = pointerType;
+        speedHoldPointerId = pointerId;
+        speedHoldPlayer = currentPlayer;
+        speedHoldOriginalPlaybackRate = Number.isFinite(playbackRate) && playbackRate > 0 ? playbackRate : 1;
+        speedHoldTimeout = setTimeout(() => {
+            speedHoldTimeout = null;
+            isSpeedHoldMode = true;
+            playbackManager.setPlaybackRate(2, speedHoldPlayer);
+            hideOsd();
+            stopOsdHideTimer();
+            showFastForwardIndicator();
+        }, 500);
+
+        return true;
+    }
+
+    function finishSpeedHold(source, runShortAction = false) {
+        if (speedHoldSource !== source) return false;
+
+        if (speedHoldTimeout) {
+            clearTimeout(speedHoldTimeout);
+            speedHoldTimeout = null;
+        }
+
+        const wasHeld = isSpeedHoldMode;
+        const pointerType = speedHoldPointerType;
+        const player = speedHoldPlayer;
+        isSpeedHoldMode = false;
+        speedHoldSource = null;
+        speedHoldPointerType = null;
+        speedHoldPointerId = null;
+        speedHoldPlayer = null;
+        hideFastForwardIndicator();
+
+        if (wasHeld) {
+            playbackManager.setPlaybackRate(speedHoldOriginalPlaybackRate, player);
+        } else if (runShortAction && source === 'keyboard') {
+            playbackManager.playPause(currentPlayer);
+            showOsd(osdBottomElement.querySelector('.btnPause'));
+        } else if (runShortAction && pointerType === 'touch') {
+            lastPointerDown = Date.now();
+            toggleOsd();
+        } else if (runShortAction && pointerType === 'mouse') {
+            scheduleMousePlayPause();
+        }
+
+        resetIdle();
+        return true;
+    }
+
+    function cancelSpeedHold() {
+        isSpaceKeyDown = false;
+        mouseIsDown = false;
+        if (speedHoldSource) {
+            finishSpeedHold(speedHoldSource);
+        } else {
+            hideFastForwardIndicator();
+            resetIdle();
+        }
+    }
+
+    function scheduleMousePlayPause() {
+        if (playPauseClickTimeout) {
+            clearTimeout(playPauseClickTimeout);
+            playPauseClickTimeout = 0;
+            return;
+        }
+
+        playPauseClickTimeout = setTimeout(() => {
+            playbackManager.playPause(currentPlayer);
+            showOsd();
+            playPauseClickTimeout = 0;
+        }, 300);
+    }
+
     function onKeyDown(e) {
         clickedElement = e.target;
 
@@ -1228,8 +1358,12 @@ export default function (view) {
 
         if (e.keyCode === 32) {
             if (e.target.tagName !== 'BUTTON' || !layoutManager.tv) {
-                playbackManager.playPause(currentPlayer);
-                showOsd(btnPlayPause);
+                if (!isSpaceKeyDown && beginSpeedHold('keyboard')) {
+                    isSpaceKeyDown = true;
+                } else if (!isSpaceKeyDown) {
+                    playbackManager.playPause(currentPlayer);
+                    showOsd(btnPlayPause);
+                }
                 e.preventDefault();
                 e.stopPropagation();
                 // Trick Firefox with a null element to skip next click
@@ -1422,7 +1556,18 @@ export default function (view) {
         }
     }
 
-    function onKeyDownCapture() {
+    function onKeyUp(e) {
+        if (e.keyCode === 32 && isSpaceKeyDown) {
+            isSpaceKeyDown = false;
+            finishSpeedHold('keyboard', true);
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }
+
+    function onKeyDownCapture(e) {
+        if (isSpeedHoldMode || (e.keyCode === 32 && isSpaceKeyDown)) return;
+
         resetIdle();
     }
 
@@ -1442,14 +1587,33 @@ export default function (view) {
         resetIdle();
     }
 
-    function onWindowMouseUp() {
+    function onWindowTouchStart(e) {
+        clickedElement = e.target;
+        mouseIsDown = true;
+        resetIdle();
+
+        if (e.target === view && e.touches?.length === 1) {
+            beginSpeedHold('pointer', 'touch', e.touches[0].identifier);
+        }
+    }
+
+    function onWindowMouseUp(e) {
         mouseIsDown = false;
+        const endedTouchId = e?.changedTouches?.[0]?.identifier;
+        const pointerIdMatches = speedHoldPointerId == null
+            || (e?.pointerId == null && endedTouchId == null)
+            || speedHoldPointerId === (e?.pointerId ?? endedTouchId);
+        const isCancelled = e?.type === 'pointercancel' || e?.type === 'touchcancel';
+        if (pointerIdMatches) {
+            finishSpeedHold('pointer', !isCancelled);
+        }
         resetIdle();
     }
 
     function onWindowDragEnd() {
         // mousedown -> dragstart -> dragend !!! no mouseup :(
         mouseIsDown = false;
+        finishSpeedHold('pointer');
         resetIdle();
     }
 
@@ -1674,6 +1838,8 @@ export default function (view) {
             showOsd();
             inputManager.on(window, onInputCommand);
             document.addEventListener('keydown', onKeyDown);
+            document.addEventListener('keyup', onKeyUp);
+            window.addEventListener('blur', cancelSpeedHold);
             dom.addEventListener(document, 'keydown', onKeyDownCapture, {
                 capture: true,
                 passive: true
@@ -1689,7 +1855,13 @@ export default function (view) {
                 capture: true,
                 passive: true
             });
-            dom.addEventListener(window, 'touchstart', onWindowMouseDown, {
+            if (window.PointerEvent) {
+                dom.addEventListener(window, 'pointercancel', onWindowMouseUp, {
+                    capture: true,
+                    passive: true
+                });
+            }
+            dom.addEventListener(window, 'touchstart', onWindowTouchStart, {
                 capture: true,
                 passive: true
             });
@@ -1716,7 +1888,10 @@ export default function (view) {
             statsOverlay.enabled(false);
         }
 
+        cancelSpeedHold();
         document.removeEventListener('keydown', onKeyDown);
+        document.removeEventListener('keyup', onKeyUp);
+        window.removeEventListener('blur', cancelSpeedHold);
         dom.removeEventListener(document, 'keydown', onKeyDownCapture, {
             capture: true,
             passive: true
@@ -1732,7 +1907,13 @@ export default function (view) {
             capture: true,
             passive: true
         });
-        dom.removeEventListener(window, 'touchstart', onWindowMouseDown, {
+        if (window.PointerEvent) {
+            dom.removeEventListener(window, 'pointercancel', onWindowMouseUp, {
+                capture: true,
+                passive: true
+            });
+        }
+        dom.removeEventListener(window, 'touchstart', onWindowTouchStart, {
             capture: true,
             passive: true
         });
@@ -1787,48 +1968,49 @@ export default function (view) {
 
         destroyStats();
         destroySubtitleSync();
+        /* eslint-disable-next-line compat/compat */
+        dom.removeEventListener(view, window.PointerEvent ? 'pointerdown' : 'mousedown', onVideoPointerDown, {
+            passive: true
+        });
+        fastForwardIndicatorElem = null;
     });
     let lastPointerDown = 0;
-    /* eslint-disable-next-line compat/compat */
-    dom.addEventListener(view, window.PointerEvent ? 'pointerdown' : 'click', function (e) {
+
+    function onVideoPointerDown(e) {
         if (dom.parentWithClass(e.target, ['videoOsdBottom', 'upNextContainer'])) {
             showOsd();
             return;
         }
+
+        if (speedHoldSource) return;
 
         const pointerType = e.pointerType || (layoutManager.mobile ? 'touch' : 'mouse');
         const now = new Date().getTime();
 
         switch (pointerType) {
             case 'touch':
-                if (now - lastPointerDown > 300) {
+                if (now - lastPointerDown < 300) break;
+
+                if (!beginSpeedHold('pointer', pointerType, e.pointerId)) {
                     lastPointerDown = now;
                     toggleOsd();
                 }
-
                 break;
 
             case 'mouse':
-                if (!e.button) {
-                    if (playPauseClickTimeout) {
-                        clearTimeout(playPauseClickTimeout);
-                        playPauseClickTimeout = 0;
-                    } else {
-                        playPauseClickTimeout = setTimeout(function() {
-                            playbackManager.playPause(currentPlayer);
-                            showOsd();
-                            playPauseClickTimeout = 0;
-                        }, 300);
-                    }
+                if (e.button === 0 && !beginSpeedHold('pointer', pointerType, e.pointerId)) {
+                    scheduleMousePlayPause();
                 }
-
                 break;
 
             default:
                 playbackManager.playPause(currentPlayer);
                 showOsd();
         }
-    }, {
+    }
+
+    /* eslint-disable-next-line compat/compat */
+    dom.addEventListener(view, window.PointerEvent ? 'pointerdown' : 'mousedown', onVideoPointerDown, {
         passive: true
     });
 

@@ -7,6 +7,7 @@ import subtitleAppearanceHelper from 'components/subtitlesettings/subtitleappear
 import { AppFeature } from 'constants/appFeature';
 import { PluginType } from 'constants/pluginType';
 import { ServerConnections } from 'lib/jellyfin-apiclient';
+import { resolveSubtitleFontBridge } from './subtitleFontBridgeResolver';
 import { currentSettings as userSettings } from 'scripts/settings/userSettings';
 import { MediaError } from 'types/mediaError';
 
@@ -273,6 +274,14 @@ export class HtmlVideoPlayer {
      * @type {any | null | undefined}
      */
     #currentAssRenderer;
+    /**
+     * @type {symbol | undefined}
+     */
+    #assRendererLoadToken;
+    /**
+     * @type {number | undefined}
+     */
+    #assRendererTargetTrackIndex;
     /**
      * @type {any | null | undefined}
      */
@@ -1299,6 +1308,12 @@ export class HtmlVideoPlayer {
      * @private
      */
     destroyCustomTrack(videoElement, targetTrackIndex) {
+        const destroysAssRenderer = targetTrackIndex === undefined
+            || this.#assRendererTargetTrackIndex === targetTrackIndex;
+        if (destroysAssRenderer) {
+            this.#assRendererLoadToken = undefined;
+            this.#assRendererTargetTrackIndex = undefined;
+        }
         if (targetTrackIndex === undefined) {
             this.endPendingSubtitleLoad(PRIMARY_TEXT_TRACK_INDEX);
             this.endPendingSubtitleLoad(SECONDARY_TEXT_TRACK_INDEX);
@@ -1310,11 +1325,13 @@ export class HtmlVideoPlayer {
         this.destroyNativeTracks(videoElement, targetTrackIndex);
         this.destroyStoredTrackInfo(targetTrackIndex);
 
-        const octopus = this.#currentAssRenderer;
-        if (octopus) {
-            octopus.dispose();
+        if (destroysAssRenderer) {
+            const octopus = this.#currentAssRenderer;
+            if (octopus) {
+                octopus.dispose();
+            }
+            this.#currentAssRenderer = null;
         }
-        this.#currentAssRenderer = null;
 
         const pgsOrVobSubRenderer = this.#currentBitmapSubRenderer;
         if (pgsOrVobSubRenderer) {
@@ -1392,80 +1409,101 @@ export class HtmlVideoPlayer {
     /**
      * @private
      */
-    renderSsaAss(videoElement, track, item) {
+    async renderSsaAss(videoElement, track, item, targetTextTrackIndex) {
+        if (this.#currentAssRenderer) {
+            this.#currentAssRenderer.dispose();
+            this.#currentAssRenderer = null;
+        }
+
         const supportedFonts = ['application/vnd.ms-opentype', 'application/x-truetype-font', 'font/otf', 'font/ttf', 'font/woff', 'font/woff2'];
-        const availableFonts = [];
-        const attachments = this._currentPlayOptions.mediaSource.MediaAttachments || [];
+        const playOptions = this._currentPlayOptions;
+        const mediaSource = playOptions.mediaSource;
+        const videoStream = getMediaStreamVideoTracks(mediaSource)[0];
         const apiClient = ServerConnections.getApiClient(item);
-        attachments.forEach(i => {
+        const loadToken = Symbol(String(track.Index));
+        this.#assRendererLoadToken = loadToken;
+        this.#assRendererTargetTrackIndex = targetTextTrackIndex;
+        const embeddedFonts = [];
+        (mediaSource.MediaAttachments || []).forEach(i => {
             // we only require font files and ignore embedded media attachments like covers as there are cases where ffmpeg fails to extract those
             if (supportedFonts.includes(i.MimeType)) {
                 // embedded font url
-                availableFonts.push(apiClient.getUrl(i.DeliveryUrl));
+                embeddedFonts.push(apiClient.getUrl(i.DeliveryUrl));
             }
         });
         const fallbackFontList = apiClient.getUrl('/FallbackFont/Fonts', {
             ApiKey: apiClient.accessToken()
         });
         const htmlVideoPlayer = this;
-        import('@jellyfin/libass-wasm').then(({ default: SubtitlesOctopus }) => {
-            const mediaSource = this._currentPlayOptions.mediaSource;
-            const videoStream = getMediaStreamVideoTracks(mediaSource)[0];
+        const workerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`;
+        const legacyWorkerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`;
+        const [
+            { default: SubtitlesOctopus },
+            config,
+            resolvedWorkerUrl,
+            resolvedLegacyWorkerUrl,
+            subtitleFontBridge
+        ] = await Promise.all([
+            import('@jellyfin/libass-wasm'),
+            apiClient.getNamedConfiguration('encoding'),
+            // Worker in Tizen 5 doesn't resolve relative path with async request
+            resolveUrl(workerUrl),
+            resolveUrl(legacyWorkerUrl),
+            resolveSubtitleFontBridge(apiClient, item.Id, mediaSource.Id, track.Index)
+        ]);
 
-            const options = {
-                video: videoElement,
-                subUrl: getTextTrackUrl(track, item),
-                fonts: availableFonts,
-                workerUrl: `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`,
-                legacyWorkerUrl: `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`,
-                onError() {
-                    // HACK: Clear JavascriptSubtitlesOctopus: it gets disposed when an error occurs
-                    htmlVideoPlayer.#currentAssRenderer = null;
+        if (this.#assRendererLoadToken !== loadToken) return;
 
-                    // HACK: Give JavascriptSubtitlesOctopus time to dispose itself
-                    setTimeout(() => {
-                        onErrorInternal(this, MediaError.ASS_RENDER_ERROR);
-                    }, 0);
-                },
-                timeOffset: (this._currentPlayOptions.transcodingOffsetTicks || 0) / 10000000,
+        const availableFonts = subtitleFontBridge.fullyResolved ? [] : embeddedFonts;
+        availableFonts.push(...subtitleFontBridge.fontUrls);
 
-                // new octopus options; override all, even defaults
-                renderMode: 'wasm-blend',
-                dropAllAnimations: false,
-                libassMemoryLimit: 40,
-                libassGlyphLimit: 40,
-                targetFps: videoStream?.ReferenceFrameRate || 24,
-                prescaleFactor: 0.8,
-                prescaleHeightLimit: 1080,
-                maxRenderHeight: 2160,
-                resizeVariation: 0.2,
-                renderAhead: 90
-            };
+        if (config.EnableFallbackFont) {
+            const fontFiles = await apiClient.getJSON(fallbackFontList);
+            if (this.#assRendererLoadToken !== loadToken) return;
 
-            Promise.all([
-                apiClient.getNamedConfiguration('encoding'),
-                // Worker in Tizen 5 doesn't resolve relative path with async request
-                resolveUrl(options.workerUrl),
-                resolveUrl(options.legacyWorkerUrl)
-            ]).then(([config, workerUrl, legacyWorkerUrl]) => {
-                options.workerUrl = workerUrl;
-                options.legacyWorkerUrl = legacyWorkerUrl;
-
-                if (config.EnableFallbackFont) {
-                    apiClient.getJSON(fallbackFontList).then((fontFiles = []) => {
-                        fontFiles.forEach(font => {
-                            const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
-                                ApiKey: apiClient.accessToken()
-                            });
-                            availableFonts.push(fontUrl);
-                        });
-                        this.#currentAssRenderer = new SubtitlesOctopus(options);
-                    });
-                } else {
-                    this.#currentAssRenderer = new SubtitlesOctopus(options);
-                }
+            (fontFiles || []).forEach(font => {
+                const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
+                    ApiKey: apiClient.accessToken()
+                });
+                availableFonts.push(fontUrl);
             });
-        });
+        }
+
+        const options = {
+            video: videoElement,
+            subUrl: getTextTrackUrl(track, item),
+            fonts: [ ...new Set(availableFonts) ],
+            workerUrl: resolvedWorkerUrl,
+            legacyWorkerUrl: resolvedLegacyWorkerUrl,
+            onError() {
+                if (htmlVideoPlayer.#assRendererLoadToken !== loadToken) return;
+
+                // HACK: Clear JavascriptSubtitlesOctopus: it gets disposed when an error occurs
+                htmlVideoPlayer.#currentAssRenderer = null;
+
+                // HACK: Give JavascriptSubtitlesOctopus time to dispose itself
+                setTimeout(() => {
+                    onErrorInternal(this, MediaError.ASS_RENDER_ERROR);
+                }, 0);
+            },
+            timeOffset: (playOptions.transcodingOffsetTicks || 0) / 10000000,
+
+            // new octopus options; override all, even defaults
+            renderMode: 'wasm-blend',
+            dropAllAnimations: false,
+            libassMemoryLimit: 40,
+            libassGlyphLimit: 40,
+            targetFps: videoStream?.ReferenceFrameRate || 24,
+            prescaleFactor: 0.8,
+            prescaleHeightLimit: 1080,
+            maxRenderHeight: 2160,
+            resizeVariation: 0.2,
+            renderAhead: 90
+        };
+
+        if (this.#assRendererLoadToken === loadToken) {
+            this.#currentAssRenderer = new SubtitlesOctopus(options);
+        }
     }
 
     /**
@@ -1630,7 +1668,7 @@ export class HtmlVideoPlayer {
         if (!itemHelper.isLocalItem(item) || track.IsExternal) {
             const format = (track.Codec || '').toLowerCase();
             if (ASS_SUBTITLE_CODECS.includes(format)) {
-                this.renderSsaAss(videoElement, track, item);
+                this.renderSsaAss(videoElement, track, item, targetTextTrackIndex);
                 return;
             }
             if (format === 'pgssub') {

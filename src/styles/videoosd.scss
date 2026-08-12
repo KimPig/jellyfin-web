@@ -112,6 +112,41 @@
     opacity: 0;
 }
 
+.ff-indicator {
+    position: fixed;
+    top: 7%;
+    top: calc(7% + env(safe-area-inset-top));
+    left: 50%;
+    z-index: 100000;
+    display: flex;
+    align-items: center;
+    padding: 0.7em 1em;
+    color: #fff;
+    font-size: 1.5rem;
+    font-weight: 600;
+    line-height: 1;
+    background: rgba(0, 0, 0, 0.8);
+    border-radius: 0.25em;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    backdrop-filter: blur(5px);
+    transform: translate(-50%, -0.35em);
+    transition: opacity 200ms ease-out, transform 200ms ease-out, visibility 0s linear 200ms;
+}
+
+.ff-indicator.visible {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, 0);
+    transition-delay: 0s;
+}
+
+.ff-indicator .material-icons {
+    margin-right: 0.35em;
+    font-size: 1.35em;
+}
+
 .osdControls {
     pointer-events: all;
     flex-grow: 1;

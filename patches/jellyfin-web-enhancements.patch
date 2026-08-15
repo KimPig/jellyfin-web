@@ -1,0 +1,1059 @@
+diff --git a/src/apps/legacy/controllers/playback/video/index.js b/src/apps/legacy/controllers/playback/video/index.js
+index fdde2c5582..b5e81df4e5 100644
+--- a/src/apps/legacy/controllers/playback/video/index.js
++++ b/src/apps/legacy/controllers/playback/video/index.js
+@@ -268,8 +268,19 @@ export default function (view) {
+     }
+ 
+     let mouseIsDown = false;
++    let speedHoldTimeout;
++    let speedHoldSource;
++    let speedHoldPointerType;
++    let speedHoldPointerId;
++    let speedHoldPlayer;
++    let speedHoldOriginalPlaybackRate = 1;
++    let isSpeedHoldMode = false;
++    let isSpaceKeyDown = false;
++    let fastForwardIndicatorElem;
+ 
+     function showOsd(focusElement) {
++        if (isSpeedHoldMode) return;
++
+         Events.trigger(document, EventType.SHOW_VIDEO_OSD, [ true ]);
+         slideDownToShow(headerElement);
+         showMainOsdControls(focusElement);
+@@ -384,6 +395,8 @@ export default function (view) {
+     }
+ 
+     function onPointerMove(e) {
++        if (isSpeedHoldMode || mouseIsDown) return;
++
+         if ((e.pointerType || (layoutManager.mobile ? 'touch' : 'mouse')) === 'mouse') {
+             const eventX = e.screenX || e.clientX || 0;
+             const eventY = e.screenY || e.clientY || 0;
+@@ -607,6 +620,7 @@ export default function (view) {
+     }
+ 
+     function releaseCurrentPlayer() {
++        cancelSpeedHold();
+         destroyStats();
+         destroySubtitleSync();
+         resetUpNextDialog();
+@@ -1214,6 +1228,122 @@ export default function (view) {
+         }
+     }
+ 
++    function supportsSpeedHold() {
++        return playbackManager.getSupportedPlaybackRates(currentPlayer)
++            .some(rate => Number(rate.id) === 2);
++    }
++
++    function createFastForwardIndicator() {
++        if (fastForwardIndicatorElem) return;
++
++        const indicator = document.createElement('div');
++        indicator.className = 'ff-indicator';
++        indicator.setAttribute('role', 'status');
++        indicator.setAttribute('aria-live', 'polite');
++        indicator.setAttribute('aria-label', '2× playback speed');
++
++        const icon = document.createElement('span');
++        icon.className = 'material-icons fast_forward';
++
++        const label = document.createElement('span');
++        label.className = 'ff-indicator-label';
++        label.textContent = '2×';
++
++        indicator.appendChild(icon);
++        indicator.appendChild(label);
++        view.appendChild(indicator);
++        fastForwardIndicatorElem = indicator;
++    }
++
++    function showFastForwardIndicator() {
++        createFastForwardIndicator();
++        fastForwardIndicatorElem.classList.add('visible');
++    }
++
++    function hideFastForwardIndicator() {
++        fastForwardIndicatorElem?.classList.remove('visible');
++    }
++
++    function beginSpeedHold(source, pointerType, pointerId) {
++        if (speedHoldSource || !supportsSpeedHold()) return false;
++
++        const playbackRate = Number(playbackManager.getPlaybackRate(currentPlayer));
++        speedHoldSource = source;
++        speedHoldPointerType = pointerType;
++        speedHoldPointerId = pointerId;
++        speedHoldPlayer = currentPlayer;
++        speedHoldOriginalPlaybackRate = Number.isFinite(playbackRate) && playbackRate > 0 ? playbackRate : 1;
++        speedHoldTimeout = setTimeout(() => {
++            speedHoldTimeout = null;
++            isSpeedHoldMode = true;
++            playbackManager.setPlaybackRate(2, speedHoldPlayer);
++            hideOsd();
++            stopOsdHideTimer();
++            showFastForwardIndicator();
++        }, 500);
++
++        return true;
++    }
++
++    function finishSpeedHold(source, runShortAction = false) {
++        if (speedHoldSource !== source) return false;
++
++        if (speedHoldTimeout) {
++            clearTimeout(speedHoldTimeout);
++            speedHoldTimeout = null;
++        }
++
++        const wasHeld = isSpeedHoldMode;
++        const pointerType = speedHoldPointerType;
++        const player = speedHoldPlayer;
++        isSpeedHoldMode = false;
++        speedHoldSource = null;
++        speedHoldPointerType = null;
++        speedHoldPointerId = null;
++        speedHoldPlayer = null;
++        hideFastForwardIndicator();
++
++        if (wasHeld) {
++            playbackManager.setPlaybackRate(speedHoldOriginalPlaybackRate, player);
++        } else if (runShortAction && source === 'keyboard') {
++            playbackManager.playPause(currentPlayer);
++            showOsd(osdBottomElement.querySelector('.btnPause'));
++        } else if (runShortAction && pointerType === 'touch') {
++            lastPointerDown = Date.now();
++            toggleOsd();
++        } else if (runShortAction && pointerType === 'mouse') {
++            scheduleMousePlayPause();
++        }
++
++        resetIdle();
++        return true;
++    }
++
++    function cancelSpeedHold() {
++        isSpaceKeyDown = false;
++        mouseIsDown = false;
++        if (speedHoldSource) {
++            finishSpeedHold(speedHoldSource);
++        } else {
++            hideFastForwardIndicator();
++            resetIdle();
++        }
++    }
++
++    function scheduleMousePlayPause() {
++        if (playPauseClickTimeout) {
++            clearTimeout(playPauseClickTimeout);
++            playPauseClickTimeout = 0;
++            return;
++        }
++
++        playPauseClickTimeout = setTimeout(() => {
++            playbackManager.playPause(currentPlayer);
++            showOsd();
++            playPauseClickTimeout = 0;
++        }, 300);
++    }
++
+     function onKeyDown(e) {
+         clickedElement = e.target;
+ 
+@@ -1228,8 +1358,12 @@ export default function (view) {
+ 
+         if (e.keyCode === 32) {
+             if (e.target.tagName !== 'BUTTON' || !layoutManager.tv) {
+-                playbackManager.playPause(currentPlayer);
+-                showOsd(btnPlayPause);
++                if (!isSpaceKeyDown && beginSpeedHold('keyboard')) {
++                    isSpaceKeyDown = true;
++                } else if (!isSpaceKeyDown) {
++                    playbackManager.playPause(currentPlayer);
++                    showOsd(btnPlayPause);
++                }
+                 e.preventDefault();
+                 e.stopPropagation();
+                 // Trick Firefox with a null element to skip next click
+@@ -1422,7 +1556,18 @@ export default function (view) {
+         }
+     }
+ 
+-    function onKeyDownCapture() {
++    function onKeyUp(e) {
++        if (e.keyCode === 32 && isSpaceKeyDown) {
++            isSpaceKeyDown = false;
++            finishSpeedHold('keyboard', true);
++            e.preventDefault();
++            e.stopPropagation();
++        }
++    }
++
++    function onKeyDownCapture(e) {
++        if (isSpeedHoldMode || (e.keyCode === 32 && isSpaceKeyDown)) return;
++
+         resetIdle();
+     }
+ 
+@@ -1442,14 +1587,33 @@ export default function (view) {
+         resetIdle();
+     }
+ 
+-    function onWindowMouseUp() {
++    function onWindowTouchStart(e) {
++        clickedElement = e.target;
++        mouseIsDown = true;
++        resetIdle();
++
++        if (e.target === view && e.touches?.length === 1) {
++            beginSpeedHold('pointer', 'touch', e.touches[0].identifier);
++        }
++    }
++
++    function onWindowMouseUp(e) {
+         mouseIsDown = false;
++        const endedTouchId = e?.changedTouches?.[0]?.identifier;
++        const pointerIdMatches = speedHoldPointerId == null
++            || (e?.pointerId == null && endedTouchId == null)
++            || speedHoldPointerId === (e?.pointerId ?? endedTouchId);
++        const isCancelled = e?.type === 'pointercancel' || e?.type === 'touchcancel';
++        if (pointerIdMatches) {
++            finishSpeedHold('pointer', !isCancelled);
++        }
+         resetIdle();
+     }
+ 
+     function onWindowDragEnd() {
+         // mousedown -> dragstart -> dragend !!! no mouseup :(
+         mouseIsDown = false;
++        finishSpeedHold('pointer');
+         resetIdle();
+     }
+ 
+@@ -1674,6 +1838,8 @@ export default function (view) {
+             showOsd();
+             inputManager.on(window, onInputCommand);
+             document.addEventListener('keydown', onKeyDown);
++            document.addEventListener('keyup', onKeyUp);
++            window.addEventListener('blur', cancelSpeedHold);
+             dom.addEventListener(document, 'keydown', onKeyDownCapture, {
+                 capture: true,
+                 passive: true
+@@ -1689,7 +1855,13 @@ export default function (view) {
+                 capture: true,
+                 passive: true
+             });
+-            dom.addEventListener(window, 'touchstart', onWindowMouseDown, {
++            if (window.PointerEvent) {
++                dom.addEventListener(window, 'pointercancel', onWindowMouseUp, {
++                    capture: true,
++                    passive: true
++                });
++            }
++            dom.addEventListener(window, 'touchstart', onWindowTouchStart, {
+                 capture: true,
+                 passive: true
+             });
+@@ -1716,7 +1888,10 @@ export default function (view) {
+             statsOverlay.enabled(false);
+         }
+ 
++        cancelSpeedHold();
+         document.removeEventListener('keydown', onKeyDown);
++        document.removeEventListener('keyup', onKeyUp);
++        window.removeEventListener('blur', cancelSpeedHold);
+         dom.removeEventListener(document, 'keydown', onKeyDownCapture, {
+             capture: true,
+             passive: true
+@@ -1732,7 +1907,13 @@ export default function (view) {
+             capture: true,
+             passive: true
+         });
+-        dom.removeEventListener(window, 'touchstart', onWindowMouseDown, {
++        if (window.PointerEvent) {
++            dom.removeEventListener(window, 'pointercancel', onWindowMouseUp, {
++                capture: true,
++                passive: true
++            });
++        }
++        dom.removeEventListener(window, 'touchstart', onWindowTouchStart, {
+             capture: true,
+             passive: true
+         });
+@@ -1787,48 +1968,49 @@ export default function (view) {
+ 
+         destroyStats();
+         destroySubtitleSync();
++        /* eslint-disable-next-line compat/compat */
++        dom.removeEventListener(view, window.PointerEvent ? 'pointerdown' : 'mousedown', onVideoPointerDown, {
++            passive: true
++        });
++        fastForwardIndicatorElem = null;
+     });
+     let lastPointerDown = 0;
+-    /* eslint-disable-next-line compat/compat */
+-    dom.addEventListener(view, window.PointerEvent ? 'pointerdown' : 'click', function (e) {
++
++    function onVideoPointerDown(e) {
+         if (dom.parentWithClass(e.target, ['videoOsdBottom', 'upNextContainer'])) {
+             showOsd();
+             return;
+         }
+ 
++        if (speedHoldSource) return;
++
+         const pointerType = e.pointerType || (layoutManager.mobile ? 'touch' : 'mouse');
+         const now = new Date().getTime();
+ 
+         switch (pointerType) {
+             case 'touch':
+-                if (now - lastPointerDown > 300) {
++                if (now - lastPointerDown < 300) break;
++
++                if (!beginSpeedHold('pointer', pointerType, e.pointerId)) {
+                     lastPointerDown = now;
+                     toggleOsd();
+                 }
+-
+                 break;
+ 
+             case 'mouse':
+-                if (!e.button) {
+-                    if (playPauseClickTimeout) {
+-                        clearTimeout(playPauseClickTimeout);
+-                        playPauseClickTimeout = 0;
+-                    } else {
+-                        playPauseClickTimeout = setTimeout(function() {
+-                            playbackManager.playPause(currentPlayer);
+-                            showOsd();
+-                            playPauseClickTimeout = 0;
+-                        }, 300);
+-                    }
++                if (e.button === 0 && !beginSpeedHold('pointer', pointerType, e.pointerId)) {
++                    scheduleMousePlayPause();
+                 }
+-
+                 break;
+ 
+             default:
+                 playbackManager.playPause(currentPlayer);
+                 showOsd();
+         }
+-    }, {
++    }
++
++    /* eslint-disable-next-line compat/compat */
++    dom.addEventListener(view, window.PointerEvent ? 'pointerdown' : 'mousedown', onVideoPointerDown, {
+         passive: true
+     });
+ 
+diff --git a/src/components/playback/skipbutton.scss b/src/components/playback/skipbutton.scss
+index 86540c6840..aef85487d2 100644
+--- a/src/components/playback/skipbutton.scss
++++ b/src/components/playback/skipbutton.scss
+@@ -2,9 +2,11 @@
+     position: fixed;
+     left: 0;
+     right: 0;
+-    bottom: 8rem;
++    bottom: var(--skip-button-bottom, 8rem);
+     pointer-events: none;
+     z-index: 10000;
++    will-change: bottom;
++    transition: bottom 250ms ease-out;
+ }
+ 
+ .skip-button {
+diff --git a/src/components/playback/skipsegment.ts b/src/components/playback/skipsegment.ts
+index ae7b43fa6e..1c14e3806f 100644
+--- a/src/components/playback/skipsegment.ts
++++ b/src/components/playback/skipsegment.ts
+@@ -9,7 +9,6 @@ import { EventType } from 'constants/eventType';
+ import './skipbutton.scss';
+ import dom from 'utils/dom';
+ import globalize from 'lib/globalize';
+-import * as userSettings from 'scripts/settings/userSettings';
+ import focusManager from 'components/focusManager';
+ import layoutManager from 'components/layoutManager';
+ 
+@@ -38,12 +37,16 @@ class SkipSegment extends PlaybackSubscriber {
+     private skipElement: HTMLButtonElement | null;
+     private currentSegment: MediaSegmentDto | null | undefined;
+     private hideTimeout: ReturnType<typeof setTimeout> | null | undefined;
++    private upNextContainer: HTMLElement | null = null;
++    private upNextObserver: MutationObserver | null = null;
++    private upNextResizeObserver: ResizeObserver | null = null;
+ 
+     constructor(playbackManager: PlaybackManager) {
+         super(playbackManager);
+ 
+         this.skipElement = null;
+         this.onOsdChanged = this.onOsdChanged.bind(this);
++        this.updateSkipButtonPosition = this.updateSkipButtonPosition.bind(this);
+     }
+ 
+     createSkipElement() {
+@@ -67,10 +70,64 @@ class SkipSegment extends PlaybackSubscriber {
+                         }
+                     }
+                 });
++                this.observeUpNextDialog();
+             }
+         }
+     }
+ 
++    private observeUpNextDialog() {
++        const upNextContainer = document.querySelector<HTMLElement>('.upNextContainer');
++        if (this.upNextContainer === upNextContainer) {
++            this.updateSkipButtonPosition();
++            return;
++        }
++
++        this.upNextObserver?.disconnect();
++        this.upNextResizeObserver?.disconnect();
++        window.removeEventListener('resize', this.updateSkipButtonPosition);
++        this.upNextContainer = upNextContainer;
++
++        if (!upNextContainer) {
++            this.updateSkipButtonPosition();
++            return;
++        }
++
++        this.upNextObserver = new MutationObserver(this.updateSkipButtonPosition);
++        this.upNextObserver.observe(upNextContainer, {
++            attributes: true,
++            attributeFilter: [ 'class' ],
++            childList: true,
++            subtree: true
++        });
++        this.upNextResizeObserver = new ResizeObserver(this.updateSkipButtonPosition);
++        this.upNextResizeObserver.observe(upNextContainer);
++        window.addEventListener('resize', this.updateSkipButtonPosition);
++        this.updateSkipButtonPosition();
++    }
++
++    private updateSkipButtonPosition() {
++        const skipContainer = this.skipElement?.closest<HTMLElement>('.skip-button-container');
++        const upNextContainer = this.upNextContainer;
++        if (!skipContainer || !upNextContainer || !this.currentSegment
++            || upNextContainer.classList.contains('hide')
++            || upNextContainer.classList.contains('upNextDialog-hidden')) {
++            skipContainer?.classList.remove('skip-button-container-up-next');
++            skipContainer?.style.removeProperty('--skip-button-bottom');
++            return;
++        }
++
++        const bounds = upNextContainer.getBoundingClientRect();
++        if (bounds.width === 0 || bounds.height === 0) {
++            return;
++        }
++
++        const gap = 16;
++        const defaultBottom = 8 * 16;
++        const bottom = Math.max(defaultBottom, window.innerHeight - bounds.top + gap);
++        skipContainer.style.setProperty('--skip-button-bottom', `${Math.ceil(bottom)}px`);
++        skipContainer.classList.add('skip-button-container-up-next');
++    }
++
+     setButtonText() {
+         if (this.skipElement && this.currentSegment) {
+             this.skipElement.innerHTML = globalize.translate('MediaSegmentSkipPrompt', globalize.translate(`MediaSegmentType.${this.currentSegment.Type}`));
+@@ -101,6 +158,7 @@ class SkipSegment extends PlaybackSubscriber {
+             }
+ 
+             requestAnimationFrame(() => {
++                this.updateSkipButtonPosition();
+                 elem.classList.remove('skip-button-hidden');
+ 
+                 if (!options.keep) {
+@@ -149,14 +207,6 @@ class SkipSegment extends PlaybackSubscriber {
+     }
+ 
+     onPromptSkip(e: Event, segment: MediaSegmentDto) {
+-        if (this.player && segment.EndTicks != null
+-            && segment.EndTicks >= this.playbackManager.currentItem(this.player).RunTimeTicks
+-            && this.playbackManager.getNextItem()
+-            && userSettings.enableNextVideoInfoOverlay()
+-        ) {
+-            // Don't display button when UpNextDialog is expected.
+-            return;
+-        }
+         if (!this.currentSegment) {
+             this.currentSegment = segment;
+ 
+@@ -186,6 +236,7 @@ class SkipSegment extends PlaybackSubscriber {
+         if (this.playbackManager.getCurrentPlayer()) {
+             Events.off(document, EventType.SHOW_VIDEO_OSD, this.onOsdChanged);
+             Events.on(document, EventType.SHOW_VIDEO_OSD, this.onOsdChanged);
++            this.observeUpNextDialog();
+         }
+     }
+ 
+diff --git a/src/plugins/htmlVideoPlayer/plugin.js b/src/plugins/htmlVideoPlayer/plugin.js
+index 4a5951b47b..2250e92f4d 100644
+--- a/src/plugins/htmlVideoPlayer/plugin.js
++++ b/src/plugins/htmlVideoPlayer/plugin.js
+@@ -7,6 +7,7 @@ import subtitleAppearanceHelper from 'components/subtitlesettings/subtitleappear
+ import { AppFeature } from 'constants/appFeature';
+ import { PluginType } from 'constants/pluginType';
+ import { ServerConnections } from 'lib/jellyfin-apiclient';
++import { resolveSubtitleFontBridge } from './subtitleFontBridgeResolver';
+ import { currentSettings as userSettings } from 'scripts/settings/userSettings';
+ import { MediaError } from 'types/mediaError';
+ 
+@@ -273,6 +274,14 @@ export class HtmlVideoPlayer {
+      * @type {any | null | undefined}
+      */
+     #currentAssRenderer;
++    /**
++     * @type {symbol | undefined}
++     */
++    #assRendererLoadToken;
++    /**
++     * @type {number | undefined}
++     */
++    #assRendererTargetTrackIndex;
+     /**
+      * @type {any | null | undefined}
+      */
+@@ -1299,6 +1308,12 @@ export class HtmlVideoPlayer {
+      * @private
+      */
+     destroyCustomTrack(videoElement, targetTrackIndex) {
++        const destroysAssRenderer = targetTrackIndex === undefined
++            || this.#assRendererTargetTrackIndex === targetTrackIndex;
++        if (destroysAssRenderer) {
++            this.#assRendererLoadToken = undefined;
++            this.#assRendererTargetTrackIndex = undefined;
++        }
+         if (targetTrackIndex === undefined) {
+             this.endPendingSubtitleLoad(PRIMARY_TEXT_TRACK_INDEX);
+             this.endPendingSubtitleLoad(SECONDARY_TEXT_TRACK_INDEX);
+@@ -1310,11 +1325,13 @@ export class HtmlVideoPlayer {
+         this.destroyNativeTracks(videoElement, targetTrackIndex);
+         this.destroyStoredTrackInfo(targetTrackIndex);
+ 
+-        const octopus = this.#currentAssRenderer;
+-        if (octopus) {
+-            octopus.dispose();
++        if (destroysAssRenderer) {
++            const octopus = this.#currentAssRenderer;
++            if (octopus) {
++                octopus.dispose();
++            }
++            this.#currentAssRenderer = null;
+         }
+-        this.#currentAssRenderer = null;
+ 
+         const pgsOrVobSubRenderer = this.#currentBitmapSubRenderer;
+         if (pgsOrVobSubRenderer) {
+@@ -1392,80 +1409,103 @@ export class HtmlVideoPlayer {
+     /**
+      * @private
+      */
+-    renderSsaAss(videoElement, track, item) {
++    async renderSsaAss(videoElement, track, item, targetTextTrackIndex) {
++        if (this.#currentAssRenderer) {
++            this.#currentAssRenderer.dispose();
++            this.#currentAssRenderer = null;
++        }
++
+         const supportedFonts = ['application/vnd.ms-opentype', 'application/x-truetype-font', 'font/otf', 'font/ttf', 'font/woff', 'font/woff2'];
+-        const availableFonts = [];
+-        const attachments = this._currentPlayOptions.mediaSource.MediaAttachments || [];
++        const playOptions = this._currentPlayOptions;
++        const mediaSource = playOptions.mediaSource;
++        const videoStream = getMediaStreamVideoTracks(mediaSource)[0];
+         const apiClient = ServerConnections.getApiClient(item);
+-        attachments.forEach(i => {
++        const loadToken = Symbol(String(track.Index));
++        this.#assRendererLoadToken = loadToken;
++        this.#assRendererTargetTrackIndex = targetTextTrackIndex;
++        const embeddedFonts = [];
++        (mediaSource.MediaAttachments || []).forEach(i => {
+             // we only require font files and ignore embedded media attachments like covers as there are cases where ffmpeg fails to extract those
+             if (supportedFonts.includes(i.MimeType)) {
+                 // embedded font url
+-                availableFonts.push(apiClient.getUrl(i.DeliveryUrl));
++                embeddedFonts.push(apiClient.getUrl(i.DeliveryUrl));
+             }
+         });
+         const fallbackFontList = apiClient.getUrl('/FallbackFont/Fonts', {
+             ApiKey: apiClient.accessToken()
+         });
+         const htmlVideoPlayer = this;
+-        import('@jellyfin/libass-wasm').then(({ default: SubtitlesOctopus }) => {
+-            const mediaSource = this._currentPlayOptions.mediaSource;
+-            const videoStream = getMediaStreamVideoTracks(mediaSource)[0];
+-
+-            const options = {
+-                video: videoElement,
+-                subUrl: getTextTrackUrl(track, item),
+-                fonts: availableFonts,
+-                workerUrl: `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`,
+-                legacyWorkerUrl: `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`,
+-                onError() {
+-                    // HACK: Clear JavascriptSubtitlesOctopus: it gets disposed when an error occurs
+-                    htmlVideoPlayer.#currentAssRenderer = null;
+-
+-                    // HACK: Give JavascriptSubtitlesOctopus time to dispose itself
+-                    setTimeout(() => {
+-                        onErrorInternal(this, MediaError.ASS_RENDER_ERROR);
+-                    }, 0);
+-                },
+-                timeOffset: (this._currentPlayOptions.transcodingOffsetTicks || 0) / 10000000,
+-
+-                // new octopus options; override all, even defaults
+-                renderMode: 'wasm-blend',
+-                dropAllAnimations: false,
+-                libassMemoryLimit: 40,
+-                libassGlyphLimit: 40,
+-                targetFps: videoStream?.ReferenceFrameRate || 24,
+-                prescaleFactor: 0.8,
+-                prescaleHeightLimit: 1080,
+-                maxRenderHeight: 2160,
+-                resizeVariation: 0.2,
+-                renderAhead: 90
+-            };
+-
+-            Promise.all([
+-                apiClient.getNamedConfiguration('encoding'),
+-                // Worker in Tizen 5 doesn't resolve relative path with async request
+-                resolveUrl(options.workerUrl),
+-                resolveUrl(options.legacyWorkerUrl)
+-            ]).then(([config, workerUrl, legacyWorkerUrl]) => {
+-                options.workerUrl = workerUrl;
+-                options.legacyWorkerUrl = legacyWorkerUrl;
+-
+-                if (config.EnableFallbackFont) {
+-                    apiClient.getJSON(fallbackFontList).then((fontFiles = []) => {
+-                        fontFiles.forEach(font => {
+-                            const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
+-                                ApiKey: apiClient.accessToken()
+-                            });
+-                            availableFonts.push(fontUrl);
+-                        });
+-                        this.#currentAssRenderer = new SubtitlesOctopus(options);
+-                    });
+-                } else {
+-                    this.#currentAssRenderer = new SubtitlesOctopus(options);
+-                }
++        const workerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`;
++        const legacyWorkerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`;
++        const [
++            { default: SubtitlesOctopus },
++            config,
++            resolvedWorkerUrl,
++            resolvedLegacyWorkerUrl,
++            subtitleFontBridge
++        ] = await Promise.all([
++            import('@jellyfin/libass-wasm'),
++            apiClient.getNamedConfiguration('encoding'),
++            // Worker in Tizen 5 doesn't resolve relative path with async request
++            resolveUrl(workerUrl),
++            resolveUrl(legacyWorkerUrl),
++            resolveSubtitleFontBridge(apiClient, item.Id, mediaSource.Id, track.Index)
++        ]);
++
++        if (this.#assRendererLoadToken !== loadToken) return;
++
++        const availableFonts = subtitleFontBridge.fullyResolved ? [] : embeddedFonts;
++        availableFonts.push(...subtitleFontBridge.fontUrls);
++
++        if (config.EnableFallbackFont) {
++            const fontFiles = await apiClient.getJSON(fallbackFontList);
++            if (this.#assRendererLoadToken !== loadToken) return;
++
++            (fontFiles || []).forEach(font => {
++                const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
++                    ApiKey: apiClient.accessToken()
++                });
++                availableFonts.push(fontUrl);
+             });
+-        });
++        }
++
++        const options = {
++            video: videoElement,
++            subUrl: getTextTrackUrl(track, item),
++            fonts: [ ...new Set(availableFonts) ],
++            availableFonts: subtitleFontBridge.availableFonts,
++            lazyFileLoading: subtitleFontBridge.fullyResolved,
++            workerUrl: resolvedWorkerUrl,
++            legacyWorkerUrl: resolvedLegacyWorkerUrl,
++            onError() {
++                if (htmlVideoPlayer.#assRendererLoadToken !== loadToken) return;
++
++                // HACK: Clear JavascriptSubtitlesOctopus: it gets disposed when an error occurs
++                htmlVideoPlayer.#currentAssRenderer = null;
++
++                // HACK: Give JavascriptSubtitlesOctopus time to dispose itself
++                setTimeout(() => {
++                    onErrorInternal(this, MediaError.ASS_RENDER_ERROR);
++                }, 0);
++            },
++            timeOffset: (playOptions.transcodingOffsetTicks || 0) / 10000000,
++
++            // new octopus options; override all, even defaults
++            renderMode: 'wasm-blend',
++            dropAllAnimations: false,
++            libassMemoryLimit: 40,
++            libassGlyphLimit: 40,
++            targetFps: videoStream?.ReferenceFrameRate || 24,
++            prescaleFactor: 0.8,
++            prescaleHeightLimit: 1080,
++            maxRenderHeight: 2160,
++            resizeVariation: 0.2,
++            renderAhead: 90
++        };
++
++        if (this.#assRendererLoadToken === loadToken) {
++            this.#currentAssRenderer = new SubtitlesOctopus(options);
++        }
+     }
+ 
+     /**
+@@ -1630,7 +1670,7 @@ export class HtmlVideoPlayer {
+         if (!itemHelper.isLocalItem(item) || track.IsExternal) {
+             const format = (track.Codec || '').toLowerCase();
+             if (ASS_SUBTITLE_CODECS.includes(format)) {
+-                this.renderSsaAss(videoElement, track, item);
++                this.renderSsaAss(videoElement, track, item, targetTextTrackIndex);
+                 return;
+             }
+             if (format === 'pgssub') {
+diff --git a/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts b/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts
+new file mode 100644
+index 0000000000..c8588a7a00
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts
+@@ -0,0 +1,150 @@
++import type { ApiClient } from 'jellyfin-apiclient';
++
++interface SubtitleFontBridgeFile {
++    Id?: string;
++    Path?: string;
++}
++
++interface SubtitleFontBridgeFamily {
++    RequestedFamily?: string;
++    FontIds?: string[];
++}
++
++interface SubtitleFontBridgeResolution {
++    RequestedFamilies?: string[];
++    MissingFamilies?: string[];
++    Files?: SubtitleFontBridgeFile[];
++    Families?: SubtitleFontBridgeFamily[];
++}
++
++interface SubtitleFontResolution {
++    Resolution?: SubtitleFontBridgeResolution;
++}
++
++export interface ResolvedSubtitleFonts {
++    /** Font URLs to pass to libass as eager fallback files. */
++    fontUrls: string[];
++    /** Lower-cased ASS family name to lazily fetched system-font URL. */
++    availableFonts: Record<string, string>;
++    fullyResolved: boolean;
++}
++
++const EMPTY_RESOLUTION: ResolvedSubtitleFonts = {
++    fontUrls: [],
++    availableFonts: {},
++    fullyResolved: false
++};
++const RESOLUTION_TIMEOUT_MS = 10_000;
++
++function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
++    return new Promise((resolve, reject) => {
++        const timeout = setTimeout(() => reject(new Error('Subtitle Font Bridge request timed out.')), timeoutMs);
++        promise.then(result => {
++            clearTimeout(timeout);
++            resolve(result);
++        }, error => {
++            clearTimeout(timeout);
++            reject(error);
++        });
++    });
++}
++
++function normalizeFamilyName(value: string | undefined): string | undefined {
++    const normalized = value?.trim().toLowerCase();
++    return normalized || undefined;
++}
++
++export function parseSubtitleFontResolution(
++    apiClient: ApiClient,
++    result?: SubtitleFontResolution | null
++): ResolvedSubtitleFonts {
++    const resolution = result?.Resolution;
++    const requestedFamilies = resolution?.RequestedFamilies;
++    const missingFamilies = resolution?.MissingFamilies;
++    const files = resolution?.Files;
++    const families = resolution?.Families;
++
++    if (!Array.isArray(requestedFamilies)
++        || !Array.isArray(missingFamilies)
++        || !Array.isArray(files)) {
++        return EMPTY_RESOLUTION;
++    }
++
++    const fontUrls = [ ...new Set(files
++        .map(file => file?.Path)
++        .filter((path): path is string => typeof path === 'string' && path.length > 0)
++        .map(path => apiClient.getUrl(path, {
++            ApiKey: apiClient.accessToken()
++        }))) ];
++
++    const urlByFontId = new Map(files
++        .filter((file): file is Required<SubtitleFontBridgeFile> => typeof file?.Id === 'string'
++            && file.Id.length > 0
++            && typeof file.Path === 'string'
++            && file.Path.length > 0)
++        .map(file => [file.Id, apiClient.getUrl(file.Path, {
++            ApiKey: apiClient.accessToken()
++        })]));
++
++    const availableFonts: Record<string, string> = {};
++    const eagerFontUrls = new Set<string>();
++
++    if (Array.isArray(families)) {
++        for (const family of families) {
++            const requestedFamily = normalizeFamilyName(family?.RequestedFamily);
++            const fontIds = family?.FontIds;
++            if (!requestedFamily || !Array.isArray(fontIds)) {
++                continue;
++            }
++
++            const urls = fontIds
++                .map(fontId => urlByFontId.get(fontId))
++                .filter((url): url is string => !!url);
++            if (urls.length === 0) {
++                continue;
++            }
++
++            // libass uses the first URL as its lazy font source for this family.
++            availableFonts[requestedFamily] = urls[0];
++            // Distinct face files still need to be available for bold/italic selection.
++            urls.slice(1).forEach(url => eagerFontUrls.add(url));
++        }
++    } else {
++        // Preserve the old, eager behavior for an older Bridge API response.
++        fontUrls.forEach(url => eagerFontUrls.add(url));
++    }
++
++    return {
++        fontUrls: [ ...eagerFontUrls ],
++        availableFonts,
++        fullyResolved: requestedFamilies.length > 0
++            && missingFamilies.length === 0
++            && Object.keys(availableFonts).length > 0
++    };
++}
++
++export async function resolveSubtitleFontBridge(
++    apiClient: ApiClient,
++    itemId: string | undefined,
++    mediaSourceId: string | undefined,
++    subtitleIndex: number | undefined
++): Promise<ResolvedSubtitleFonts> {
++    if (!itemId || !mediaSourceId || !Number.isInteger(subtitleIndex)) {
++        return EMPTY_RESOLUTION;
++    }
++
++    const url = apiClient.getUrl(
++        `SubtitleFontBridge/Subtitles/${encodeURIComponent(itemId)}/${encodeURIComponent(mediaSourceId)}/${subtitleIndex}`
++    );
++
++    try {
++        const result = await withTimeout(
++            apiClient.getJSON(url) as Promise<SubtitleFontResolution>,
++            RESOLUTION_TIMEOUT_MS
++        );
++        return parseSubtitleFontResolution(apiClient, result);
++    } catch (error) {
++        console.debug('Subtitle Font Bridge plugin is unavailable; using embedded subtitle fonts.', error instanceof Error ? error.message : error);
++        return EMPTY_RESOLUTION;
++    }
++}
+\ No newline at end of file
+diff --git a/src/styles/videoosd.scss b/src/styles/videoosd.scss
+index 9b7c25d8de..db11b793ef 100644
+--- a/src/styles/videoosd.scss
++++ b/src/styles/videoosd.scss
+@@ -112,6 +112,41 @@
+     opacity: 0;
+ }
+ 
++.ff-indicator {
++    position: fixed;
++    top: 7%;
++    top: calc(7% + env(safe-area-inset-top));
++    left: 50%;
++    z-index: 100000;
++    display: flex;
++    align-items: center;
++    padding: 0.7em 1em;
++    color: #fff;
++    font-size: 1.5rem;
++    font-weight: 600;
++    line-height: 1;
++    background: rgba(0, 0, 0, 0.65);
++    border-radius: 0.25em;
++    opacity: 0;
++    visibility: hidden;
++    pointer-events: none;
++    backdrop-filter: blur(5px);
++    transform: translate(-50%, -0.35em);
++    transition: opacity 200ms ease-out, transform 200ms ease-out, visibility 0s linear 200ms;
++}
++
++.ff-indicator.visible {
++    opacity: 1;
++    visibility: visible;
++    transform: translate(-50%, 0);
++    transition-delay: 0s;
++}
++
++.ff-indicator .material-icons {
++    margin-right: 0.35em;
++    font-size: 1.35em;
++}
++
+ .osdControls {
+     pointer-events: all;
+     flex-grow: 1;
+diff --git a/src/utils/subtitleFontBridgeResolver.test.ts b/src/utils/subtitleFontBridgeResolver.test.ts
+new file mode 100644
+index 0000000000..b5c17ddffc
+--- /dev/null
++++ b/src/utils/subtitleFontBridgeResolver.test.ts
+@@ -0,0 +1,124 @@
++import type { ApiClient } from 'jellyfin-apiclient';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import { parseSubtitleFontResolution, resolveSubtitleFontBridge } from '../plugins/htmlVideoPlayer/subtitleFontBridgeResolver';
++
++afterEach(() => {
++    vi.useRealTimers();
++});
++
++function createApiClient(getJSON = vi.fn()) {
++    return {
++        accessToken: vi.fn(() => 'access-token'),
++        getJSON,
++        getUrl: vi.fn((path: string, params?: Record<string, string>) => {
++            const url = new URL(path, 'https://example.test/');
++            if (params) {
++                Object.entries(params).forEach(([ key, value ]) => {
++                    url.searchParams.set(key, value);
++                });
++            }
++            return url.toString();
++        })
++    } as unknown as ApiClient;
++}
++
++describe('Subtitle Font Bridge resolver', () => {
++    it('maps resolved system font families for lazy loading and skips attachments', () => {
++        const apiClient = createApiClient();
++        const result = parseSubtitleFontResolution(apiClient, {
++            Resolution: {
++                RequestedFamilies: [ 'Arial', 'Malgun Gothic' ],
++                MissingFamilies: [],
++                Files: [
++                    { Id: 'arial', Path: 'SubtitleFontBridge/Files/one.ttf' },
++                    { Id: 'malgun', Path: 'SubtitleFontBridge/Files/two.ttc' }
++                ],
++                Families: [
++                    { RequestedFamily: 'Arial', FontIds: [ 'arial' ] },
++                    { RequestedFamily: 'Malgun Gothic', FontIds: [ 'malgun' ] }
++                ]
++            }
++        });
++
++        expect(result.fullyResolved).toBe(true);
++        expect(result.fontUrls).toEqual([]);
++        expect(result.availableFonts).toEqual({
++            arial: 'https://example.test/SubtitleFontBridge/Files/one.ttf?ApiKey=access-token',
++            'malgun gothic': 'https://example.test/SubtitleFontBridge/Files/two.ttc?ApiKey=access-token'
++        });
++    });
++
++    it('keeps additional font face files eager while the family source stays lazy', () => {
++        const apiClient = createApiClient();
++        const result = parseSubtitleFontResolution(apiClient, {
++            Resolution: {
++                RequestedFamilies: [ 'Arial' ],
++                MissingFamilies: [],
++                Files: [
++                    { Id: 'regular', Path: 'SubtitleFontBridge/Files/regular.ttf' },
++                    { Id: 'bold', Path: 'SubtitleFontBridge/Files/bold.ttf' }
++                ],
++                Families: [ { RequestedFamily: 'Arial', FontIds: [ 'regular', 'bold' ] } ]
++            }
++        });
++
++        expect(result.availableFonts).toEqual({
++            arial: 'https://example.test/SubtitleFontBridge/Files/regular.ttf?ApiKey=access-token'
++        });
++        expect(result.fontUrls).toEqual([
++            'https://example.test/SubtitleFontBridge/Files/bold.ttf?ApiKey=access-token'
++        ]);
++    });
++
++    it('keeps embedded fonts available when a family is missing', () => {
++        const apiClient = createApiClient();
++        const result = parseSubtitleFontResolution(apiClient, {
++            Resolution: {
++                RequestedFamilies: [ 'Arial', 'Missing Font' ],
++                MissingFamilies: [ 'Missing Font' ],
++                Files: [ { Path: 'SubtitleFontBridge/Files/one.ttf' } ]
++            }
++        });
++
++        expect(result.fullyResolved).toBe(false);
++        expect(result.fontUrls).toHaveLength(1);
++    });
++
++    it('does not skip embedded fonts for an empty or malformed response', () => {
++        const apiClient = createApiClient();
++
++        expect(parseSubtitleFontResolution(apiClient, {
++            Resolution: {
++                RequestedFamilies: [],
++                MissingFamilies: [],
++                Files: []
++            }
++        })).toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
++        expect(parseSubtitleFontResolution(apiClient, null))
++            .toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
++    });
++
++    it('falls back cleanly when the plugin endpoint is unavailable', async () => {
++        const getJSON = vi.fn().mockRejectedValue(new Error('Not Found'));
++        const apiClient = createApiClient(getJSON);
++        vi.spyOn(console, 'debug').mockImplementation(() => undefined);
++
++        await expect(resolveSubtitleFontBridge(apiClient, 'item', 'source', 4))
++            .resolves.toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
++        expect(getJSON).toHaveBeenCalledWith(
++            'https://example.test/SubtitleFontBridge/Subtitles/item/source/4'
++        );
++    });
++
++    it('does not block ASS rendering when the plugin request stalls', async () => {
++        vi.useFakeTimers();
++        const apiClient = createApiClient(vi.fn(() => new Promise(() => undefined)));
++        vi.spyOn(console, 'debug').mockImplementation(() => undefined);
++
++        const resultPromise = resolveSubtitleFontBridge(apiClient, 'item', 'source', 4);
++        await vi.advanceTimersByTimeAsync(10_000);
++
++        await expect(resultPromise).resolves.toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
++    });
++});

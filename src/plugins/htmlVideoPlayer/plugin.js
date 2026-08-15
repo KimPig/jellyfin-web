@@ -1473,6 +1473,8 @@ export class HtmlVideoPlayer {
             video: videoElement,
             subUrl: getTextTrackUrl(track, item),
             fonts: [ ...new Set(availableFonts) ],
+            availableFonts: subtitleFontBridge.availableFonts,
+            lazyFileLoading: subtitleFontBridge.fullyResolved,
             workerUrl: resolvedWorkerUrl,
             legacyWorkerUrl: resolvedLegacyWorkerUrl,
             onError() {

@@ -2,9 +2,11 @@
     position: fixed;
     left: 0;
     right: 0;
-    bottom: 8rem;
+    bottom: var(--skip-button-bottom, 8rem);
     pointer-events: none;
     z-index: 10000;
+    will-change: bottom;
+    transition: bottom 250ms ease-out;
 }
 
 .skip-button {

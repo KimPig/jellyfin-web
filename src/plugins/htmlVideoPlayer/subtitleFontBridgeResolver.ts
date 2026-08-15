@@ -1,13 +1,20 @@
 import type { ApiClient } from 'jellyfin-apiclient';
 
 interface SubtitleFontBridgeFile {
+    Id?: string;
     Path?: string;
+}
+
+interface SubtitleFontBridgeFamily {
+    RequestedFamily?: string;
+    FontIds?: string[];
 }
 
 interface SubtitleFontBridgeResolution {
     RequestedFamilies?: string[];
     MissingFamilies?: string[];
     Files?: SubtitleFontBridgeFile[];
+    Families?: SubtitleFontBridgeFamily[];
 }
 
 interface SubtitleFontResolution {
@@ -15,12 +22,16 @@ interface SubtitleFontResolution {
 }
 
 export interface ResolvedSubtitleFonts {
+    /** Font URLs to pass to libass as eager fallback files. */
     fontUrls: string[];
+    /** Lower-cased ASS family name to lazily fetched system-font URL. */
+    availableFonts: Record<string, string>;
     fullyResolved: boolean;
 }
 
 const EMPTY_RESOLUTION: ResolvedSubtitleFonts = {
     fontUrls: [],
+    availableFonts: {},
     fullyResolved: false
 };
 const RESOLUTION_TIMEOUT_MS = 10_000;
@@ -38,6 +49,11 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
     });
 }
 
+function normalizeFamilyName(value: string | undefined): string | undefined {
+    const normalized = value?.trim().toLowerCase();
+    return normalized || undefined;
+}
+
 export function parseSubtitleFontResolution(
     apiClient: ApiClient,
     result?: SubtitleFontResolution | null
@@ -46,6 +62,7 @@ export function parseSubtitleFontResolution(
     const requestedFamilies = resolution?.RequestedFamilies;
     const missingFamilies = resolution?.MissingFamilies;
     const files = resolution?.Files;
+    const families = resolution?.Families;
 
     if (!Array.isArray(requestedFamilies)
         || !Array.isArray(missingFamilies)
@@ -60,11 +77,49 @@ export function parseSubtitleFontResolution(
             ApiKey: apiClient.accessToken()
         }))) ];
 
+    const urlByFontId = new Map(files
+        .filter((file): file is Required<SubtitleFontBridgeFile> => typeof file?.Id === 'string'
+            && file.Id.length > 0
+            && typeof file.Path === 'string'
+            && file.Path.length > 0)
+        .map(file => [file.Id, apiClient.getUrl(file.Path, {
+            ApiKey: apiClient.accessToken()
+        })]));
+
+    const availableFonts: Record<string, string> = {};
+    const eagerFontUrls = new Set<string>();
+
+    if (Array.isArray(families)) {
+        for (const family of families) {
+            const requestedFamily = normalizeFamilyName(family?.RequestedFamily);
+            const fontIds = family?.FontIds;
+            if (!requestedFamily || !Array.isArray(fontIds)) {
+                continue;
+            }
+
+            const urls = fontIds
+                .map(fontId => urlByFontId.get(fontId))
+                .filter((url): url is string => !!url);
+            if (urls.length === 0) {
+                continue;
+            }
+
+            // libass uses the first URL as its lazy font source for this family.
+            availableFonts[requestedFamily] = urls[0];
+            // Distinct face files still need to be available for bold/italic selection.
+            urls.slice(1).forEach(url => eagerFontUrls.add(url));
+        }
+    } else {
+        // Preserve the old, eager behavior for an older Bridge API response.
+        fontUrls.forEach(url => eagerFontUrls.add(url));
+    }
+
     return {
-        fontUrls,
+        fontUrls: [ ...eagerFontUrls ],
+        availableFonts,
         fullyResolved: requestedFamilies.length > 0
             && missingFamilies.length === 0
-            && fontUrls.length > 0
+            && Object.keys(availableFonts).length > 0
     };
 }
 

@@ -1,0 +1,119 @@
+name: Build Bridge-patched Jellyfin Web
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Official Jellyfin Web tag to build (empty = latest release)'
+        required: false
+        type: string
+      include_prereleases:
+        description: 'Allow pre-release tags when choosing the latest release'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bridge-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      AUTOMATION_REF: master
+    steps:
+      - name: Check out automation files
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          path: automation
+
+      - name: Choose an upstream release
+        id: upstream
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          INCLUDE_PRERELEASES: ${{ inputs.include_prereleases || 'true' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            tag="$REQUESTED_TAG"
+          else
+            releases="$(gh api 'repos/jellyfin/jellyfin-web/releases?per_page=30')"
+            if [[ "$INCLUDE_PRERELEASES" == 'true' ]]; then
+              tag="$(jq -r '[.[] | select(.draft | not)] | .[0].tag_name // empty' <<<"$releases")"
+            else
+              tag="$(jq -r '[.[] | select(.draft | not) | select(.prerelease | not)] | .[0].tag_name // empty' <<<"$releases")"
+            fi
+          fi
+          test -n "$tag"
+          bridge_tag="${tag}-bridge.1"
+          if gh release view "$bridge_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A Bridge release for $tag already exists."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "bridge_tag=$bridge_tag" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check out and patch official Jellyfin Web
+        if: steps.upstream.outputs.publish == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          git clone https://github.com/jellyfin/jellyfin-web.git upstream-web
+          git -C upstream-web checkout "$UPSTREAM_TAG"
+          git -C upstream-web apply --3way --whitespace=error ../automation/patches/jellyfin-web-enhancements.patch
+          git -C upstream-web diff --check
+
+      - name: Install dependencies
+        if: steps.upstream.outputs.publish == 'true'
+        working-directory: upstream-web
+        run: npm ci
+
+      - name: Verify Bridge integration
+        if: steps.upstream.outputs.publish == 'true'
+        working-directory: upstream-web
+        run: |
+          npm run build:check
+          npm test -- --run src/utils/subtitleFontBridgeResolver.test.ts
+
+      - name: Build production Web assets
+        if: steps.upstream.outputs.publish == 'true'
+        working-directory: upstream-web
+        run: npm run build:production
+
+      - name: Publish patched source branch and release
+        if: steps.upstream.outputs.publish == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+          BRIDGE_TAG: ${{ steps.upstream.outputs.bridge_tag }}
+        run: |
+          set -euo pipefail
+          branch="bridge/$UPSTREAM_TAG"
+          git -C upstream-web config user.name 'github-actions[bot]'
+          git -C upstream-web config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C upstream-web add src/apps/legacy/controllers/playback/video/index.js src/components/playback/skipbutton.scss src/components/playback/skipsegment.ts src/plugins/htmlVideoPlayer/plugin.js src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts src/styles/videoosd.scss src/utils/subtitleFontBridgeResolver.test.ts
+          git -C upstream-web commit -m "feat: apply Subtitle Font Bridge to $UPSTREAM_TAG"
+          git -C upstream-web tag -a "$BRIDGE_TAG" -m "Subtitle Font Bridge build for $UPSTREAM_TAG"
+          git -C upstream-web remote add target "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git -C upstream-web push target "HEAD:refs/heads/$branch" "refs/tags/$BRIDGE_TAG"
+          (
+            cd upstream-web
+            zip -qr "../jellyfin-web-${BRIDGE_TAG}-dist.zip" dist
+            sha256sum "../jellyfin-web-${BRIDGE_TAG}-dist.zip" > "../jellyfin-web-${BRIDGE_TAG}-dist.zip.sha256"
+          )
+          gh release create "$BRIDGE_TAG" \
+            "jellyfin-web-${BRIDGE_TAG}-dist.zip" \
+            "jellyfin-web-${BRIDGE_TAG}-dist.zip.sha256" \
+            --target "$branch" \
+            --title "Jellyfin Web $UPSTREAM_TAG + Subtitle Font Bridge" \
+            --notes "Automated Bridge build from official Jellyfin Web $UPSTREAM_TAG. The release ZIP contains the patched production dist assets."

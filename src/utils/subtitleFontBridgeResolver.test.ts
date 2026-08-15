@@ -24,24 +24,50 @@ function createApiClient(getJSON = vi.fn()) {
 }
 
 describe('Subtitle Font Bridge resolver', () => {
-    it('uses authenticated font URLs and skips attachments when every family resolves', () => {
+    it('maps resolved system font families for lazy loading and skips attachments', () => {
         const apiClient = createApiClient();
         const result = parseSubtitleFontResolution(apiClient, {
             Resolution: {
                 RequestedFamilies: [ 'Arial', 'Malgun Gothic' ],
                 MissingFamilies: [],
                 Files: [
-                    { Path: 'SubtitleFontBridge/Files/one.ttf' },
-                    { Path: 'SubtitleFontBridge/Files/one.ttf' },
-                    { Path: 'SubtitleFontBridge/Files/two.ttc' }
+                    { Id: 'arial', Path: 'SubtitleFontBridge/Files/one.ttf' },
+                    { Id: 'malgun', Path: 'SubtitleFontBridge/Files/two.ttc' }
+                ],
+                Families: [
+                    { RequestedFamily: 'Arial', FontIds: [ 'arial' ] },
+                    { RequestedFamily: 'Malgun Gothic', FontIds: [ 'malgun' ] }
                 ]
             }
         });
 
         expect(result.fullyResolved).toBe(true);
+        expect(result.fontUrls).toEqual([]);
+        expect(result.availableFonts).toEqual({
+            arial: 'https://example.test/SubtitleFontBridge/Files/one.ttf?ApiKey=access-token',
+            'malgun gothic': 'https://example.test/SubtitleFontBridge/Files/two.ttc?ApiKey=access-token'
+        });
+    });
+
+    it('keeps additional font face files eager while the family source stays lazy', () => {
+        const apiClient = createApiClient();
+        const result = parseSubtitleFontResolution(apiClient, {
+            Resolution: {
+                RequestedFamilies: [ 'Arial' ],
+                MissingFamilies: [],
+                Files: [
+                    { Id: 'regular', Path: 'SubtitleFontBridge/Files/regular.ttf' },
+                    { Id: 'bold', Path: 'SubtitleFontBridge/Files/bold.ttf' }
+                ],
+                Families: [ { RequestedFamily: 'Arial', FontIds: [ 'regular', 'bold' ] } ]
+            }
+        });
+
+        expect(result.availableFonts).toEqual({
+            arial: 'https://example.test/SubtitleFontBridge/Files/regular.ttf?ApiKey=access-token'
+        });
         expect(result.fontUrls).toEqual([
-            'https://example.test/SubtitleFontBridge/Files/one.ttf?ApiKey=access-token',
-            'https://example.test/SubtitleFontBridge/Files/two.ttc?ApiKey=access-token'
+            'https://example.test/SubtitleFontBridge/Files/bold.ttf?ApiKey=access-token'
         ]);
     });
 
@@ -68,9 +94,9 @@ describe('Subtitle Font Bridge resolver', () => {
                 MissingFamilies: [],
                 Files: []
             }
-        })).toEqual({ fontUrls: [], fullyResolved: false });
+        })).toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
         expect(parseSubtitleFontResolution(apiClient, null))
-            .toEqual({ fontUrls: [], fullyResolved: false });
+            .toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
     });
 
     it('falls back cleanly when the plugin endpoint is unavailable', async () => {
@@ -79,7 +105,7 @@ describe('Subtitle Font Bridge resolver', () => {
         vi.spyOn(console, 'debug').mockImplementation(() => undefined);
 
         await expect(resolveSubtitleFontBridge(apiClient, 'item', 'source', 4))
-            .resolves.toEqual({ fontUrls: [], fullyResolved: false });
+            .resolves.toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
         expect(getJSON).toHaveBeenCalledWith(
             'https://example.test/SubtitleFontBridge/Subtitles/item/source/4'
         );
@@ -93,6 +119,6 @@ describe('Subtitle Font Bridge resolver', () => {
         const resultPromise = resolveSubtitleFontBridge(apiClient, 'item', 'source', 4);
         await vi.advanceTimersByTimeAsync(10_000);
 
-        await expect(resultPromise).resolves.toEqual({ fontUrls: [], fullyResolved: false });
+        await expect(resultPromise).resolves.toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
     });
 });

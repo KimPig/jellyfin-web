@@ -6,11 +6,10 @@ small integration patch: `patches/jellyfin-web-enhancements.patch`.
 The patch contains three focused playback improvements:
 
 - **Subtitle Font Bridge:** asks the installed server plugin which ASS font
-  families are used, then passes authenticated system-font URLs to
-  `@jellyfin/libass-wasm` as `availableFonts` with lazy file loading. This avoids
-  waiting for Jellyfin to extract every attached MKV font before first render;
-  embedded attachments remain the fallback when Bridge is unavailable or cannot
-  resolve every requested family.
+  families are used, then preloads only the required authenticated system-font files into
+  `@jellyfin/libass-wasm`. This avoids waiting for Jellyfin to extract every
+  attached MKV font before first render; embedded attachments remain the fallback
+  when Bridge is unavailable or cannot resolve every requested family.
 - **Hold for 2×:** keeps Jellyfin Web's playback-manager, OSD, keyboard, mouse,
   and touch integration for temporary 2× playback.
 - **Outro skip with Up Next:** keeps the outro skip button visible even when the

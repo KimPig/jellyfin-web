@@ -1454,8 +1454,12 @@ export class HtmlVideoPlayer {
 
         if (this.#assRendererLoadToken !== loadToken) return;
 
-        const availableFonts = subtitleFontBridge.fullyResolved ? [] : embeddedFonts;
-        availableFonts.push(...subtitleFontBridge.fontUrls);
+        // Preload the Bridge's small, exact system-font set. Do not use
+        // libass' lazy-file mode here: its synchronous range-request path is
+        // not reliable for controller-hosted plugin files.
+        const availableFonts = subtitleFontBridge.fullyResolved
+            ? [ ...subtitleFontBridge.fontUrls ]
+            : [ ...embeddedFonts, ...subtitleFontBridge.fontUrls ];
 
         if (config.EnableFallbackFont) {
             const fontFiles = await apiClient.getJSON(fallbackFontList);
@@ -1473,8 +1477,6 @@ export class HtmlVideoPlayer {
             video: videoElement,
             subUrl: getTextTrackUrl(track, item),
             fonts: [ ...new Set(availableFonts) ],
-            availableFonts: subtitleFontBridge.availableFonts,
-            lazyFileLoading: subtitleFontBridge.fullyResolved,
             workerUrl: resolvedWorkerUrl,
             legacyWorkerUrl: resolvedLegacyWorkerUrl,
             onError() {

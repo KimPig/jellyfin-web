@@ -24,7 +24,7 @@ function createApiClient(getJSON = vi.fn()) {
 }
 
 describe('Subtitle Font Bridge resolver', () => {
-    it('maps resolved system font families for lazy loading and skips attachments', () => {
+    it('preloads the resolved system font files and skips attachments', () => {
         const apiClient = createApiClient();
         const result = parseSubtitleFontResolution(apiClient, {
             Resolution: {
@@ -42,14 +42,13 @@ describe('Subtitle Font Bridge resolver', () => {
         });
 
         expect(result.fullyResolved).toBe(true);
-        expect(result.fontUrls).toEqual([]);
-        expect(result.availableFonts).toEqual({
-            arial: 'https://example.test/SubtitleFontBridge/Files/one.ttf?ApiKey=access-token',
-            'malgun gothic': 'https://example.test/SubtitleFontBridge/Files/two.ttc?ApiKey=access-token'
-        });
+        expect(result.fontUrls).toEqual([
+            'https://example.test/SubtitleFontBridge/Files/one.ttf?ApiKey=access-token',
+            'https://example.test/SubtitleFontBridge/Files/two.ttc?ApiKey=access-token'
+        ]);
     });
 
-    it('keeps additional font face files eager while the family source stays lazy', () => {
+    it('preloads every resolved face file for a family', () => {
         const apiClient = createApiClient();
         const result = parseSubtitleFontResolution(apiClient, {
             Resolution: {
@@ -63,10 +62,8 @@ describe('Subtitle Font Bridge resolver', () => {
             }
         });
 
-        expect(result.availableFonts).toEqual({
-            arial: 'https://example.test/SubtitleFontBridge/Files/regular.ttf?ApiKey=access-token'
-        });
         expect(result.fontUrls).toEqual([
+            'https://example.test/SubtitleFontBridge/Files/regular.ttf?ApiKey=access-token',
             'https://example.test/SubtitleFontBridge/Files/bold.ttf?ApiKey=access-token'
         ]);
     });
@@ -94,9 +91,9 @@ describe('Subtitle Font Bridge resolver', () => {
                 MissingFamilies: [],
                 Files: []
             }
-        })).toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
+        })).toEqual({ fontUrls: [], fullyResolved: false });
         expect(parseSubtitleFontResolution(apiClient, null))
-            .toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
+            .toEqual({ fontUrls: [], fullyResolved: false });
     });
 
     it('falls back cleanly when the plugin endpoint is unavailable', async () => {
@@ -105,7 +102,7 @@ describe('Subtitle Font Bridge resolver', () => {
         vi.spyOn(console, 'debug').mockImplementation(() => undefined);
 
         await expect(resolveSubtitleFontBridge(apiClient, 'item', 'source', 4))
-            .resolves.toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
+            .resolves.toEqual({ fontUrls: [], fullyResolved: false });
         expect(getJSON).toHaveBeenCalledWith(
             'https://example.test/SubtitleFontBridge/Subtitles/item/source/4'
         );
@@ -119,6 +116,6 @@ describe('Subtitle Font Bridge resolver', () => {
         const resultPromise = resolveSubtitleFontBridge(apiClient, 'item', 'source', 4);
         await vi.advanceTimersByTimeAsync(10_000);
 
-        await expect(resultPromise).resolves.toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
+        await expect(resultPromise).resolves.toEqual({ fontUrls: [], fullyResolved: false });
     });
 });

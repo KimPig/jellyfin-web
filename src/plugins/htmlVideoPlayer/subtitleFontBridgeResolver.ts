@@ -22,16 +22,13 @@ interface SubtitleFontResolution {
 }
 
 export interface ResolvedSubtitleFonts {
-    /** Font URLs to pass to libass as eager fallback files. */
+    /** Font URLs to preload in libass when the Bridge resolves the ASS families. */
     fontUrls: string[];
-    /** Lower-cased ASS family name to lazily fetched system-font URL. */
-    availableFonts: Record<string, string>;
     fullyResolved: boolean;
 }
 
 const EMPTY_RESOLUTION: ResolvedSubtitleFonts = {
     fontUrls: [],
-    availableFonts: {},
     fullyResolved: false
 };
 const RESOLUTION_TIMEOUT_MS = 10_000;
@@ -77,18 +74,7 @@ export function parseSubtitleFontResolution(
             ApiKey: apiClient.accessToken()
         }))) ];
 
-    const urlByFontId = new Map(files
-        .filter((file): file is Required<SubtitleFontBridgeFile> => typeof file?.Id === 'string'
-            && file.Id.length > 0
-            && typeof file.Path === 'string'
-            && file.Path.length > 0)
-        .map(file => [file.Id, apiClient.getUrl(file.Path, {
-            ApiKey: apiClient.accessToken()
-        })]));
-
-    const availableFonts: Record<string, string> = {};
-    const eagerFontUrls = new Set<string>();
-
+    const resolvableFamilies = new Set<string>();
     if (Array.isArray(families)) {
         for (const family of families) {
             const requestedFamily = normalizeFamilyName(family?.RequestedFamily);
@@ -97,29 +83,26 @@ export function parseSubtitleFontResolution(
                 continue;
             }
 
-            const urls = fontIds
-                .map(fontId => urlByFontId.get(fontId))
-                .filter((url): url is string => !!url);
-            if (urls.length === 0) {
-                continue;
+            const hasResolvedFile = fontIds.some(fontId => files.some(file =>
+                file?.Id === fontId && typeof file.Path === 'string' && file.Path.length > 0));
+            if (hasResolvedFile) {
+                resolvableFamilies.add(requestedFamily);
             }
-
-            // libass uses the first URL as its lazy font source for this family.
-            availableFonts[requestedFamily] = urls[0];
-            // Distinct face files still need to be available for bold/italic selection.
-            urls.slice(1).forEach(url => eagerFontUrls.add(url));
         }
-    } else {
-        // Preserve the old, eager behavior for an older Bridge API response.
-        fontUrls.forEach(url => eagerFontUrls.add(url));
     }
 
+    const fullyResolved = requestedFamilies.length > 0
+        && missingFamilies.length === 0
+        && requestedFamilies.every(requestedFamily => {
+            const normalizedFamily = normalizeFamilyName(requestedFamily);
+            return normalizedFamily !== undefined && resolvableFamilies.has(normalizedFamily);
+        });
+
     return {
-        fontUrls: [ ...eagerFontUrls ],
-        availableFonts,
-        fullyResolved: requestedFamilies.length > 0
-            && missingFamilies.length === 0
-            && Object.keys(availableFonts).length > 0
+        // Preload only the system font files needed by this ASS. This is more
+        // reliable than libass' synchronous lazy-file path for plugin endpoints.
+        fontUrls,
+        fullyResolved
     };
 }
 

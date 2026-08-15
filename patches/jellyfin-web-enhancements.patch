@@ -492,7 +492,7 @@ index ae7b43fa6e..1c14e3806f 100644
      }
  
 diff --git a/src/plugins/htmlVideoPlayer/plugin.js b/src/plugins/htmlVideoPlayer/plugin.js
-index 4a5951b47b..2250e92f4d 100644
+index 4a5951b47b..a8d5b0caa7 100644
 --- a/src/plugins/htmlVideoPlayer/plugin.js
 +++ b/src/plugins/htmlVideoPlayer/plugin.js
 @@ -7,6 +7,7 @@ import subtitleAppearanceHelper from 'components/subtitlesettings/subtitleappear
@@ -549,7 +549,7 @@ index 4a5951b47b..2250e92f4d 100644
  
          const pgsOrVobSubRenderer = this.#currentBitmapSubRenderer;
          if (pgsOrVobSubRenderer) {
-@@ -1392,80 +1409,103 @@ export class HtmlVideoPlayer {
+@@ -1392,80 +1409,105 @@ export class HtmlVideoPlayer {
      /**
       * @private
       */
@@ -659,8 +659,12 @@ index 4a5951b47b..2250e92f4d 100644
 +
 +        if (this.#assRendererLoadToken !== loadToken) return;
 +
-+        const availableFonts = subtitleFontBridge.fullyResolved ? [] : embeddedFonts;
-+        availableFonts.push(...subtitleFontBridge.fontUrls);
++        // Preload the Bridge's small, exact system-font set. Do not use
++        // libass' lazy-file mode here: its synchronous range-request path is
++        // not reliable for controller-hosted plugin files.
++        const availableFonts = subtitleFontBridge.fullyResolved
++            ? [ ...subtitleFontBridge.fontUrls ]
++            : [ ...embeddedFonts, ...subtitleFontBridge.fontUrls ];
 +
 +        if (config.EnableFallbackFont) {
 +            const fontFiles = await apiClient.getJSON(fallbackFontList);
@@ -679,8 +683,6 @@ index 4a5951b47b..2250e92f4d 100644
 +            video: videoElement,
 +            subUrl: getTextTrackUrl(track, item),
 +            fonts: [ ...new Set(availableFonts) ],
-+            availableFonts: subtitleFontBridge.availableFonts,
-+            lazyFileLoading: subtitleFontBridge.fullyResolved,
 +            workerUrl: resolvedWorkerUrl,
 +            legacyWorkerUrl: resolvedLegacyWorkerUrl,
 +            onError() {
@@ -715,7 +717,7 @@ index 4a5951b47b..2250e92f4d 100644
      }
  
      /**
-@@ -1630,7 +1670,7 @@ export class HtmlVideoPlayer {
+@@ -1630,7 +1672,7 @@ export class HtmlVideoPlayer {
          if (!itemHelper.isLocalItem(item) || track.IsExternal) {
              const format = (track.Codec || '').toLowerCase();
              if (ASS_SUBTITLE_CODECS.includes(format)) {
@@ -726,10 +728,10 @@ index 4a5951b47b..2250e92f4d 100644
              if (format === 'pgssub') {
 diff --git a/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts b/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts
 new file mode 100644
-index 0000000000..c8588a7a00
+index 0000000000..d8ed15ec40
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,133 @@
 +import type { ApiClient } from 'jellyfin-apiclient';
 +
 +interface SubtitleFontBridgeFile {
@@ -754,16 +756,13 @@ index 0000000000..c8588a7a00
 +}
 +
 +export interface ResolvedSubtitleFonts {
-+    /** Font URLs to pass to libass as eager fallback files. */
++    /** Font URLs to preload in libass when the Bridge resolves the ASS families. */
 +    fontUrls: string[];
-+    /** Lower-cased ASS family name to lazily fetched system-font URL. */
-+    availableFonts: Record<string, string>;
 +    fullyResolved: boolean;
 +}
 +
 +const EMPTY_RESOLUTION: ResolvedSubtitleFonts = {
 +    fontUrls: [],
-+    availableFonts: {},
 +    fullyResolved: false
 +};
 +const RESOLUTION_TIMEOUT_MS = 10_000;
@@ -809,18 +808,7 @@ index 0000000000..c8588a7a00
 +            ApiKey: apiClient.accessToken()
 +        }))) ];
 +
-+    const urlByFontId = new Map(files
-+        .filter((file): file is Required<SubtitleFontBridgeFile> => typeof file?.Id === 'string'
-+            && file.Id.length > 0
-+            && typeof file.Path === 'string'
-+            && file.Path.length > 0)
-+        .map(file => [file.Id, apiClient.getUrl(file.Path, {
-+            ApiKey: apiClient.accessToken()
-+        })]));
-+
-+    const availableFonts: Record<string, string> = {};
-+    const eagerFontUrls = new Set<string>();
-+
++    const resolvableFamilies = new Set<string>();
 +    if (Array.isArray(families)) {
 +        for (const family of families) {
 +            const requestedFamily = normalizeFamilyName(family?.RequestedFamily);
@@ -829,29 +817,26 @@ index 0000000000..c8588a7a00
 +                continue;
 +            }
 +
-+            const urls = fontIds
-+                .map(fontId => urlByFontId.get(fontId))
-+                .filter((url): url is string => !!url);
-+            if (urls.length === 0) {
-+                continue;
++            const hasResolvedFile = fontIds.some(fontId => files.some(file =>
++                file?.Id === fontId && typeof file.Path === 'string' && file.Path.length > 0));
++            if (hasResolvedFile) {
++                resolvableFamilies.add(requestedFamily);
 +            }
-+
-+            // libass uses the first URL as its lazy font source for this family.
-+            availableFonts[requestedFamily] = urls[0];
-+            // Distinct face files still need to be available for bold/italic selection.
-+            urls.slice(1).forEach(url => eagerFontUrls.add(url));
 +        }
-+    } else {
-+        // Preserve the old, eager behavior for an older Bridge API response.
-+        fontUrls.forEach(url => eagerFontUrls.add(url));
 +    }
 +
++    const fullyResolved = requestedFamilies.length > 0
++        && missingFamilies.length === 0
++        && requestedFamilies.every(requestedFamily => {
++            const normalizedFamily = normalizeFamilyName(requestedFamily);
++            return normalizedFamily !== undefined && resolvableFamilies.has(normalizedFamily);
++        });
++
 +    return {
-+        fontUrls: [ ...eagerFontUrls ],
-+        availableFonts,
-+        fullyResolved: requestedFamilies.length > 0
-+            && missingFamilies.length === 0
-+            && Object.keys(availableFonts).length > 0
++        // Preload only the system font files needed by this ASS. This is more
++        // reliable than libass' synchronous lazy-file path for plugin endpoints.
++        fontUrls,
++        fullyResolved
 +    };
 +}
 +
@@ -929,10 +914,10 @@ index 9b7c25d8de..db11b793ef 100644
      flex-grow: 1;
 diff --git a/src/utils/subtitleFontBridgeResolver.test.ts b/src/utils/subtitleFontBridgeResolver.test.ts
 new file mode 100644
-index 0000000000..b5c17ddffc
+index 0000000000..47e296d7b0
 --- /dev/null
 +++ b/src/utils/subtitleFontBridgeResolver.test.ts
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,121 @@
 +import type { ApiClient } from 'jellyfin-apiclient';
 +import { afterEach, describe, expect, it, vi } from 'vitest';
 +
@@ -959,7 +944,7 @@ index 0000000000..b5c17ddffc
 +}
 +
 +describe('Subtitle Font Bridge resolver', () => {
-+    it('maps resolved system font families for lazy loading and skips attachments', () => {
++    it('preloads the resolved system font files and skips attachments', () => {
 +        const apiClient = createApiClient();
 +        const result = parseSubtitleFontResolution(apiClient, {
 +            Resolution: {
@@ -977,14 +962,13 @@ index 0000000000..b5c17ddffc
 +        });
 +
 +        expect(result.fullyResolved).toBe(true);
-+        expect(result.fontUrls).toEqual([]);
-+        expect(result.availableFonts).toEqual({
-+            arial: 'https://example.test/SubtitleFontBridge/Files/one.ttf?ApiKey=access-token',
-+            'malgun gothic': 'https://example.test/SubtitleFontBridge/Files/two.ttc?ApiKey=access-token'
-+        });
++        expect(result.fontUrls).toEqual([
++            'https://example.test/SubtitleFontBridge/Files/one.ttf?ApiKey=access-token',
++            'https://example.test/SubtitleFontBridge/Files/two.ttc?ApiKey=access-token'
++        ]);
 +    });
 +
-+    it('keeps additional font face files eager while the family source stays lazy', () => {
++    it('preloads every resolved face file for a family', () => {
 +        const apiClient = createApiClient();
 +        const result = parseSubtitleFontResolution(apiClient, {
 +            Resolution: {
@@ -998,10 +982,8 @@ index 0000000000..b5c17ddffc
 +            }
 +        });
 +
-+        expect(result.availableFonts).toEqual({
-+            arial: 'https://example.test/SubtitleFontBridge/Files/regular.ttf?ApiKey=access-token'
-+        });
 +        expect(result.fontUrls).toEqual([
++            'https://example.test/SubtitleFontBridge/Files/regular.ttf?ApiKey=access-token',
 +            'https://example.test/SubtitleFontBridge/Files/bold.ttf?ApiKey=access-token'
 +        ]);
 +    });
@@ -1029,9 +1011,9 @@ index 0000000000..b5c17ddffc
 +                MissingFamilies: [],
 +                Files: []
 +            }
-+        })).toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
++        })).toEqual({ fontUrls: [], fullyResolved: false });
 +        expect(parseSubtitleFontResolution(apiClient, null))
-+            .toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
++            .toEqual({ fontUrls: [], fullyResolved: false });
 +    });
 +
 +    it('falls back cleanly when the plugin endpoint is unavailable', async () => {
@@ -1040,7 +1022,7 @@ index 0000000000..b5c17ddffc
 +        vi.spyOn(console, 'debug').mockImplementation(() => undefined);
 +
 +        await expect(resolveSubtitleFontBridge(apiClient, 'item', 'source', 4))
-+            .resolves.toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
++            .resolves.toEqual({ fontUrls: [], fullyResolved: false });
 +        expect(getJSON).toHaveBeenCalledWith(
 +            'https://example.test/SubtitleFontBridge/Subtitles/item/source/4'
 +        );
@@ -1054,6 +1036,6 @@ index 0000000000..b5c17ddffc
 +        const resultPromise = resolveSubtitleFontBridge(apiClient, 'item', 'source', 4);
 +        await vi.advanceTimersByTimeAsync(10_000);
 +
-+        await expect(resultPromise).resolves.toEqual({ fontUrls: [], availableFonts: {}, fullyResolved: false });
++        await expect(resultPromise).resolves.toEqual({ fontUrls: [], fullyResolved: false });
 +    });
 +});

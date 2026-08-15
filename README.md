@@ -1,3 +1,29 @@
+# Jellyfin Web Enhancements
+
+This repository is a small compatibility fork of the official
+[Jellyfin Web](https://github.com/jellyfin/jellyfin-web) project. It keeps the
+upstream Web client as its base while adding a focused playback patch for a
+Windows Jellyfin server.
+
+## Added features
+
+- **Subtitle Font Bridge compatibility:** resolves the ASS/SSA font families
+  used by the selected subtitle through the Subtitle Font Bridge server plugin,
+  then preloads only the matching server-installed fonts. Embedded MKV fonts remain a
+  fallback when the plugin is unavailable or cannot resolve every family.
+- **Hold for 2× playback:** temporarily plays at 2× while Space, the primary
+  mouse button, or a touch press is held; playback speed and normal controls
+  are restored on release.
+- **Outro skip with Up Next:** keeps the outro skip button visible when Next
+  Video information is enabled and animates it above the displayed Up Next
+  card instead of hiding it.
+
+Automated releases poll upstream Jellyfin Web releases, apply this patch, run
+validation and a production build, and publish only successful patched builds.
+See [BRIDGE.md](BRIDGE.md) for the release process and compatibility details.
+
+---
+
 <h1 align="center">Jellyfin Web</h1>
 <h3 align="center">Part of the <a href="https://jellyfin.org">Jellyfin Project</a></h3>
 

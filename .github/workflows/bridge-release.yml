@@ -117,16 +117,16 @@ jobs:
           git -C upstream-web push --force target "HEAD:refs/heads/$branch" "refs/tags/$BRIDGE_TAG"
           (
             cd upstream-web
-            zip -qr "../jellyfin-web-${BRIDGE_TAG}-dist.zip" dist
-            sha256sum "../jellyfin-web-${BRIDGE_TAG}-dist.zip" > "../jellyfin-web-${BRIDGE_TAG}-dist.zip.sha256"
+            zip -qr "../jellyfin-web-${UPSTREAM_TAG}-dist.zip" dist
+            sha256sum "../jellyfin-web-${UPSTREAM_TAG}-dist.zip" > "../jellyfin-web-${UPSTREAM_TAG}-dist.zip.sha256"
           )
           release_flags=()
           if [[ "$UPSTREAM_TAG" == *-* ]]; then
             release_flags+=(--prerelease)
           fi
           gh release create "$BRIDGE_TAG" \
-            "jellyfin-web-${BRIDGE_TAG}-dist.zip" \
-            "jellyfin-web-${BRIDGE_TAG}-dist.zip.sha256" \
+            "jellyfin-web-${UPSTREAM_TAG}-dist.zip" \
+            "jellyfin-web-${UPSTREAM_TAG}-dist.zip.sha256" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$branch" \
             "${release_flags[@]}" \

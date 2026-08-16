@@ -120,10 +120,15 @@ jobs:
             zip -qr "../jellyfin-web-${BRIDGE_TAG}-dist.zip" dist
             sha256sum "../jellyfin-web-${BRIDGE_TAG}-dist.zip" > "../jellyfin-web-${BRIDGE_TAG}-dist.zip.sha256"
           )
+          release_flags=()
+          if [[ "$UPSTREAM_TAG" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
           gh release create "$BRIDGE_TAG" \
             "jellyfin-web-${BRIDGE_TAG}-dist.zip" \
             "jellyfin-web-${BRIDGE_TAG}-dist.zip.sha256" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$branch" \
+            "${release_flags[@]}" \
             --title "Jellyfin Web $UPSTREAM_TAG + Subtitle Font Bridge" \
             --notes "Automated Bridge build from official Jellyfin Web $UPSTREAM_TAG. The release ZIP contains the patched production dist assets."

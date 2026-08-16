@@ -130,5 +130,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$branch" \
             "${release_flags[@]}" \
-            --title "Jellyfin Web $UPSTREAM_TAG + Subtitle Font Bridge" \
+            --title "Jellyfin Web $UPSTREAM_TAG" \
             --notes "Automated Bridge build from official Jellyfin Web $UPSTREAM_TAG. The release ZIP contains the patched production dist assets."

@@ -74,6 +74,15 @@ jobs:
           git -C upstream-web apply --3way --whitespace=error ../automation/patches/jellyfin-web-enhancements.patch
           git -C upstream-web diff --check
 
+      - name: Setup node environment
+        if: steps.upstream.outputs.publish == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: upstream-web/.nvmrc
+          cache: npm
+          cache-dependency-path: upstream-web/package-lock.json
+          check-latest: true
+
       - name: Install dependencies
         if: steps.upstream.outputs.publish == 'true'
         working-directory: upstream-web

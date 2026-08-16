@@ -492,7 +492,7 @@ index ae7b43fa6e..1c14e3806f 100644
      }
  
 diff --git a/src/plugins/htmlVideoPlayer/plugin.js b/src/plugins/htmlVideoPlayer/plugin.js
-index 4a5951b47b..a8d5b0caa7 100644
+index 4a5951b47b..6d3c14aa87 100644
 --- a/src/plugins/htmlVideoPlayer/plugin.js
 +++ b/src/plugins/htmlVideoPlayer/plugin.js
 @@ -7,6 +7,7 @@ import subtitleAppearanceHelper from 'components/subtitlesettings/subtitleappear
@@ -549,7 +549,7 @@ index 4a5951b47b..a8d5b0caa7 100644
  
          const pgsOrVobSubRenderer = this.#currentBitmapSubRenderer;
          if (pgsOrVobSubRenderer) {
-@@ -1392,80 +1409,105 @@ export class HtmlVideoPlayer {
+@@ -1392,80 +1409,120 @@ export class HtmlVideoPlayer {
      /**
       * @private
       */
@@ -662,9 +662,7 @@ index 4a5951b47b..a8d5b0caa7 100644
 +        // Preload the Bridge's small, exact system-font set. Do not use
 +        // libass' lazy-file mode here: its synchronous range-request path is
 +        // not reliable for controller-hosted plugin files.
-+        const availableFonts = subtitleFontBridge.fullyResolved
-+            ? [ ...subtitleFontBridge.fontUrls ]
-+            : [ ...embeddedFonts, ...subtitleFontBridge.fontUrls ];
++        const resolvedFonts = [ ...subtitleFontBridge.fontUrls ];
 +
 +        if (config.EnableFallbackFont) {
 +            const fontFiles = await apiClient.getJSON(fallbackFontList);
@@ -674,15 +672,15 @@ index 4a5951b47b..a8d5b0caa7 100644
 +                const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
 +                    ApiKey: apiClient.accessToken()
 +                });
-+                availableFonts.push(fontUrl);
++                resolvedFonts.push(fontUrl);
              });
--        });
 +        }
 +
-+        const options = {
++        const embeddedFallbackFonts = [ ...new Set([ ...embeddedFonts, ...resolvedFonts ]) ];
++        const createOptions = (fonts, retryWithEmbeddedFonts) => ({
 +            video: videoElement,
 +            subUrl: getTextTrackUrl(track, item),
-+            fonts: [ ...new Set(availableFonts) ],
++            fonts,
 +            workerUrl: resolvedWorkerUrl,
 +            legacyWorkerUrl: resolvedLegacyWorkerUrl,
 +            onError() {
@@ -693,6 +691,16 @@ index 4a5951b47b..a8d5b0caa7 100644
 +
 +                // HACK: Give JavascriptSubtitlesOctopus time to dispose itself
 +                setTimeout(() => {
++                    if (htmlVideoPlayer.#assRendererLoadToken !== loadToken) return;
++
++                    if (retryWithEmbeddedFonts) {
++                        console.warn('Subtitle Font Bridge rendering failed; retrying with embedded fonts.');
++                        htmlVideoPlayer.#currentAssRenderer = new SubtitlesOctopus(
++                            createOptions(embeddedFallbackFonts, false)
++                        );
++                        return;
++                    }
++
 +                    onErrorInternal(this, MediaError.ASS_RENDER_ERROR);
 +                }, 0);
 +            },
@@ -709,7 +717,13 @@ index 4a5951b47b..a8d5b0caa7 100644
 +            maxRenderHeight: 2160,
 +            resizeVariation: 0.2,
 +            renderAhead: 90
-+        };
+         });
++
++        const useBridgeOnly = subtitleFontBridge.fullyResolved;
++        const options = createOptions(
++            useBridgeOnly ? [ ...new Set(resolvedFonts) ] : embeddedFallbackFonts,
++            useBridgeOnly && embeddedFonts.length > 0
++        );
 +
 +        if (this.#assRendererLoadToken === loadToken) {
 +            this.#currentAssRenderer = new SubtitlesOctopus(options);
@@ -717,7 +731,7 @@ index 4a5951b47b..a8d5b0caa7 100644
      }
  
      /**
-@@ -1630,7 +1672,7 @@ export class HtmlVideoPlayer {
+@@ -1630,7 +1687,7 @@ export class HtmlVideoPlayer {
          if (!itemHelper.isLocalItem(item) || track.IsExternal) {
              const format = (track.Codec || '').toLowerCase();
              if (ASS_SUBTITLE_CODECS.includes(format)) {
@@ -728,7 +742,7 @@ index 4a5951b47b..a8d5b0caa7 100644
              if (format === 'pgssub') {
 diff --git a/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts b/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts
 new file mode 100644
-index 0000000000..d8ed15ec40
+index 0000000000..b3081bf406
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts
 @@ -0,0 +1,133 @@
@@ -865,7 +879,6 @@ index 0000000000..d8ed15ec40
 +        return EMPTY_RESOLUTION;
 +    }
 +}
-\ No newline at end of file
 diff --git a/src/styles/videoosd.scss b/src/styles/videoosd.scss
 index 9b7c25d8de..db11b793ef 100644
 --- a/src/styles/videoosd.scss

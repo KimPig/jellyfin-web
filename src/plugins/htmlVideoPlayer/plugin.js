@@ -1457,9 +1457,7 @@ export class HtmlVideoPlayer {
         // Preload the Bridge's small, exact system-font set. Do not use
         // libass' lazy-file mode here: its synchronous range-request path is
         // not reliable for controller-hosted plugin files.
-        const availableFonts = subtitleFontBridge.fullyResolved
-            ? [ ...subtitleFontBridge.fontUrls ]
-            : [ ...embeddedFonts, ...subtitleFontBridge.fontUrls ];
+        const resolvedFonts = [ ...subtitleFontBridge.fontUrls ];
 
         if (config.EnableFallbackFont) {
             const fontFiles = await apiClient.getJSON(fallbackFontList);
@@ -1469,14 +1467,15 @@ export class HtmlVideoPlayer {
                 const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
                     ApiKey: apiClient.accessToken()
                 });
-                availableFonts.push(fontUrl);
+                resolvedFonts.push(fontUrl);
             });
         }
 
-        const options = {
+        const embeddedFallbackFonts = [ ...new Set([ ...embeddedFonts, ...resolvedFonts ]) ];
+        const createOptions = (fonts, retryWithEmbeddedFonts) => ({
             video: videoElement,
             subUrl: getTextTrackUrl(track, item),
-            fonts: [ ...new Set(availableFonts) ],
+            fonts,
             workerUrl: resolvedWorkerUrl,
             legacyWorkerUrl: resolvedLegacyWorkerUrl,
             onError() {
@@ -1487,6 +1486,16 @@ export class HtmlVideoPlayer {
 
                 // HACK: Give JavascriptSubtitlesOctopus time to dispose itself
                 setTimeout(() => {
+                    if (htmlVideoPlayer.#assRendererLoadToken !== loadToken) return;
+
+                    if (retryWithEmbeddedFonts) {
+                        console.warn('Subtitle Font Bridge rendering failed; retrying with embedded fonts.');
+                        htmlVideoPlayer.#currentAssRenderer = new SubtitlesOctopus(
+                            createOptions(embeddedFallbackFonts, false)
+                        );
+                        return;
+                    }
+
                     onErrorInternal(this, MediaError.ASS_RENDER_ERROR);
                 }, 0);
             },
@@ -1503,7 +1512,13 @@ export class HtmlVideoPlayer {
             maxRenderHeight: 2160,
             resizeVariation: 0.2,
             renderAhead: 90
-        };
+        });
+
+        const useBridgeOnly = subtitleFontBridge.fullyResolved;
+        const options = createOptions(
+            useBridgeOnly ? [ ...new Set(resolvedFonts) ] : embeddedFallbackFonts,
+            useBridgeOnly && embeddedFonts.length > 0
+        );
 
         if (this.#assRendererLoadToken === loadToken) {
             this.#currentAssRenderer = new SubtitlesOctopus(options);

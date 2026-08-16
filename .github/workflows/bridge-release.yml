@@ -114,7 +114,7 @@ jobs:
           git -C upstream-web commit -m "feat: apply Subtitle Font Bridge to $UPSTREAM_TAG"
           git -C upstream-web tag -a "$BRIDGE_TAG" -m "Subtitle Font Bridge build for $UPSTREAM_TAG"
           git -C upstream-web remote add target "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git -C upstream-web push target "HEAD:refs/heads/$branch" "refs/tags/$BRIDGE_TAG"
+          git -C upstream-web push --force target "HEAD:refs/heads/$branch" "refs/tags/$BRIDGE_TAG"
           (
             cd upstream-web
             zip -qr "../jellyfin-web-${BRIDGE_TAG}-dist.zip" dist
@@ -123,6 +123,7 @@ jobs:
           gh release create "$BRIDGE_TAG" \
             "jellyfin-web-${BRIDGE_TAG}-dist.zip" \
             "jellyfin-web-${BRIDGE_TAG}-dist.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$branch" \
             --title "Jellyfin Web $UPSTREAM_TAG + Subtitle Font Bridge" \
             --notes "Automated Bridge build from official Jellyfin Web $UPSTREAM_TAG. The release ZIP contains the patched production dist assets."

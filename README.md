@@ -11,6 +11,10 @@ Windows Jellyfin server.
   used by the selected subtitle through the Subtitle Font Bridge server plugin,
   then preloads only the matching server-installed fonts. Embedded MKV fonts remain a
   fallback when the plugin is unavailable or cannot resolve every family.
+- **Reliable text-subtitle switching:** manages ASS/SSA and SRT renderer
+  lifecycles explicitly, cancels obsolete requests, synchronizes seek and
+  buffering transitions, and restores the previous selection if a replacement
+  fails. Jellyfin's original fallback remains available for unsupported paths.
 - **Hold for 2× playback:** temporarily plays at 2× while Space, the primary
   mouse button, or a touch press is held; playback speed and normal controls
   are restored on release.

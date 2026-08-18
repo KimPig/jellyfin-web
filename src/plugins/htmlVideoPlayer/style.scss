@@ -17,6 +17,19 @@
     order: -1;
 }
 
+// Managed ASS renderers must never become flex items. A flex sibling can
+// temporarily resize the video while SRT and ASS renderers are atomically
+// swapped, producing a visible layout jump.
+.videoPlayerContainer .subtitle-pipeline-ass {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 1;
+}
+
 /* Controls are enabled for devices that don't support autoplay. They will be hidden when playback starts.
    In Tizen 2.3 (and probably other old web engines), subtitles are located under '-webkit-media-controls' tree.
    Therefore, we hide controls only if they are enabled.

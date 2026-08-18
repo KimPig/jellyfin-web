@@ -1,5 +1,5 @@
 diff --git a/src/apps/legacy/controllers/playback/video/index.js b/src/apps/legacy/controllers/playback/video/index.js
-index fdde2c5582..b5e81df4e5 100644
+index fdde2c558253161aeae75afe34fe46056d2ed5ae..b5e81df4e512ca697bd4bad08ea14ac558b64172 100644
 --- a/src/apps/legacy/controllers/playback/video/index.js
 +++ b/src/apps/legacy/controllers/playback/video/index.js
 @@ -268,8 +268,19 @@ export default function (view) {
@@ -350,7 +350,7 @@ index fdde2c5582..b5e81df4e5 100644
      });
  
 diff --git a/src/components/playback/skipbutton.scss b/src/components/playback/skipbutton.scss
-index 86540c6840..aef85487d2 100644
+index 86540c68409736ce5550f2eab644f2a1769fb277..aef85487d2a287a5f57549e0565a641b4aee5665 100644
 --- a/src/components/playback/skipbutton.scss
 +++ b/src/components/playback/skipbutton.scss
 @@ -2,9 +2,11 @@
@@ -367,7 +367,7 @@ index 86540c6840..aef85487d2 100644
  
  .skip-button {
 diff --git a/src/components/playback/skipsegment.ts b/src/components/playback/skipsegment.ts
-index ae7b43fa6e..1c14e3806f 100644
+index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..1c14e3806f40570cacfba626a0929242a4c76602 100644
 --- a/src/components/playback/skipsegment.ts
 +++ b/src/components/playback/skipsegment.ts
 @@ -9,7 +9,6 @@ import { EventType } from 'constants/eventType';
@@ -492,98 +492,616 @@ index ae7b43fa6e..1c14e3806f 100644
      }
  
 diff --git a/src/plugins/htmlVideoPlayer/plugin.js b/src/plugins/htmlVideoPlayer/plugin.js
-index 4a5951b47b..6d3c14aa87 100644
+index 4a5951b47b3f6088d867681c0bd4415cd78a268c..8e05683ddb933b4b8cfd09e3dee2163fda89c5ab 100644
 --- a/src/plugins/htmlVideoPlayer/plugin.js
 +++ b/src/plugins/htmlVideoPlayer/plugin.js
-@@ -7,6 +7,7 @@ import subtitleAppearanceHelper from 'components/subtitlesettings/subtitleappear
+@@ -1,4 +1,3 @@
+-import DOMPurify from 'dompurify';
+ import debounce from 'lodash-es/debounce';
+ import Screenfull from 'screenfull';
+ 
+@@ -7,6 +6,8 @@ import subtitleAppearanceHelper from 'components/subtitlesettings/subtitleappear
  import { AppFeature } from 'constants/appFeature';
  import { PluginType } from 'constants/pluginType';
  import { ServerConnections } from 'lib/jellyfin-apiclient';
-+import { resolveSubtitleFontBridge } from './subtitleFontBridgeResolver';
++import { HtmlVideoTextSubtitlePipeline } from './subtitles/HtmlVideoTextSubtitlePipeline';
++import { normalizeTrackEventText } from './subtitles/renderers/TextEventRenderer';
  import { currentSettings as userSettings } from 'scripts/settings/userSettings';
  import { MediaError } from 'types/mediaError';
  
-@@ -273,6 +274,14 @@ export class HtmlVideoPlayer {
-      * @type {any | null | undefined}
+@@ -47,8 +48,21 @@ import { isHls } from '../../utils/mediaSource.ts';
+ 
+ const NATIVE_UNSUPPORTED_SUBTITLE_CODECS = ['ssa', 'ass', 'pgssub', 'dvdsub', 'vobsub'];
+ const ASS_SUBTITLE_CODECS = ['ssa', 'ass'];
++const SRT_SUBTITLE_CODECS = ['srt', 'subrip'];
+ const VOBSUB_SUBTITLE_CODECS = ['dvdsub', 'vobsub'];
+ const BITMAP_SUBTITLE_ASPECT_MODES = ['stretch', 'contain', 'cover'];
++const PLAYBACK_DIAGNOSTIC_VERSION = '2026-08-18.4';
++const PLAYBACK_DIAGNOSTIC_EVENTS = [
++    'loadstart',
++    'loadedmetadata',
++    'loadeddata',
++    'canplay',
++    'canplaythrough',
++    'waiting',
++    'stalled',
++    'suspend',
++    'playing'
++];
+ 
+ /**
+  * Returns resolved URL.
+@@ -70,18 +84,6 @@ function resolveUrl(url) {
+     });
+ }
+ 
+-function tryRemoveElement(elem) {
+-    const parentNode = elem.parentNode;
+-    if (parentNode) {
+-        // Seeing crashes in edge webview
+-        try {
+-            parentNode.removeChild(elem);
+-        } catch (err) {
+-            console.error(`error removing dialog element: ${err}`);
+-        }
+-    }
+-}
+-
+ function enableNativeTrackSupport(mediaSource, track) {
+     if (track?.DeliveryMethod === 'Embed') {
+         return true;
+@@ -129,12 +131,6 @@ function requireHlsPlayer(callback) {
+     });
+ }
+ 
+-function getMediaStreamVideoTracks(mediaSource) {
+-    return mediaSource.MediaStreams.filter(function (s) {
+-        return s.Type === 'Video';
+-    });
+-}
+-
+ function getMediaStreamAudioTracks(mediaSource) {
+     return mediaSource.MediaStreams.filter(function (s) {
+         return s.Type === 'Audio';
+@@ -157,16 +153,6 @@ function zoomIn(elem) {
+     });
+ }
+ 
+-function normalizeTrackEventText(text, useHtml) {
+-    const result = text
+-        .replace(/\\N/gi, '\n') // Correct newline characters
+-        .replace(/\r/gi, '') // Remove carriage return characters
+-        .replace(/{\\.*?}/gi, '') // Remove ass/ssa tags
+-        // Force LTR as the default direction
+-        .split('\n').map(val => `\u200E${val}`).join('\n');
+-    return useHtml ? result.replace(/\n/gi, '<br>') : result;
+-}
+-
+ function getTextTrackUrl(track, item, format) {
+     if (itemHelper.isLocalItem(item) && track.Path) {
+         return track.Path;
+@@ -270,21 +256,19 @@ export class HtmlVideoPlayer {
       */
-     #currentAssRenderer;
-+    /**
-+     * @type {symbol | undefined}
-+     */
-+    #assRendererLoadToken;
-+    /**
-+     * @type {number | undefined}
-+     */
-+    #assRendererTargetTrackIndex;
+     #audioTrackIndexToSetOnPlaying;
      /**
-      * @type {any | null | undefined}
+-     * @type {any | null | undefined}
++     * @type {HtmlVideoTextSubtitlePipeline | null | undefined}
       */
-@@ -1299,6 +1308,12 @@ export class HtmlVideoPlayer {
+-    #currentAssRenderer;
++    #textSubtitlePipeline;
+     /**
+-     * @type {any | null | undefined}
+-     */
+-    #currentBitmapSubRenderer;
+-    /**
+-     * @type {number | undefined}
++     * Incremented whenever playback starts or stops so asynchronous subtitle
++     * work from an older media source can never become active in a new one.
++     * @type {number}
+      */
+-    #customTrackIndex;
++    #subtitlePlaybackGeneration = 0;
+     /**
+-     * @type {number | undefined}
++     * @type {any | null | undefined}
+      */
+-    #customSecondaryTrackIndex;
++    #currentBitmapSubRenderer;
+     /**
+      * @type {boolean | undefined}
+      */
+@@ -297,22 +281,7 @@ export class HtmlVideoPlayer {
+      * @type {HTMLElement | null | undefined}
+      */
+     #secondaryTrackOffset;
+-    /**
+-     * @type {HTMLElement | null | undefined}
+-     */
+-    #videoSubtitlesElem;
+-    /**
+-     * @type {HTMLElement | null | undefined}
+-     */
+-    #videoSecondarySubtitlesElem;
+-    /**
+-     * @type {any | null | undefined}
+-     */
+-    #currentTrackEvents;
+-    /**
+-     * @type {any | null | undefined}
+-     */
+-    #currentSecondaryTrackEvents;
++
+     /**
+      * @type {string[] | undefined}
+      */
+@@ -329,6 +298,20 @@ export class HtmlVideoPlayer {
+      * @type {Map<number, { token: symbol, active: boolean }>}
+      */
+     #pendingSubtitleLoads = new Map();
++
++    /**
++     * @type {Map<number, symbol>}
++     */
++    #subtitleTrackSelectionTokens = new Map();
++    /**
++     * @type {number}
++     */
++    #playbackDiagnosticStartedAt = 0;
++    /**
++     * @type {number}
++     */
++    #playbackDiagnosticSequence = 0;
++
+     /**
+      * @type {string | undefined}
+      */
+@@ -384,6 +367,33 @@ export class HtmlVideoPlayer {
+         return this.#currentSrc;
+     }
+ 
++    /**
++     * @private
++     */
++    logPlaybackDiagnostic(event, videoElement = this.#mediaElement, details = {}) {
++        const now = performance.now();
++        const elapsedMs = this.#playbackDiagnosticStartedAt > 0 ?
++            Math.round((now - this.#playbackDiagnosticStartedAt) * 10) / 10 :
++            0;
++        const payload = {
++            sequence: ++this.#playbackDiagnosticSequence,
++            event,
++            elapsedMs,
++            readyState: videoElement?.readyState,
++            networkState: videoElement?.networkState,
++            currentTime: videoElement?.currentTime,
++            ...details
++        };
++        console.info(`[PlaybackDiag ${PLAYBACK_DIAGNOSTIC_VERSION}] ${JSON.stringify(payload)}`);
++    }
++
++    /**
++     * @private
++     */
++    onPlaybackDiagnosticEvent = (event) => {
++        this.logPlaybackDiagnostic(`media-${event.type}`, event.currentTarget);
++    };
++
+     /**
+      * @private
+      */
+@@ -500,6 +510,13 @@ export class HtmlVideoPlayer {
+     }
+ 
+     async play(options) {
++        this.resetTextSubtitlePipeline();
++        this.#playbackDiagnosticStartedAt = performance.now();
++        this.#playbackDiagnosticSequence = 0;
++        this.logPlaybackDiagnostic('play-requested', undefined, {
++            playMethod: options.playMethod,
++            playbackGeneration: this.#subtitlePlaybackGeneration
++        });
+         this.#started = false;
+         this.#timeUpdated = false;
+ 
+@@ -514,10 +531,14 @@ export class HtmlVideoPlayer {
+         }
+ 
+         const elem = await this.createMediaElement(options);
++        this.logPlaybackDiagnostic('media-element-ready', elem);
+         this.#applyAspectRatio(options.aspectRatio || this.getAspectRatio());
+ 
+         await this.updateVideoUrl(options);
+-        return this.setCurrentSrc(elem, options);
++        this.logPlaybackDiagnostic('video-url-ready', elem);
++        const result = await this.setCurrentSrc(elem, options);
++        this.logPlaybackDiagnostic('play-promise-resolved', elem);
++        return result;
+     }
+ 
+     /**
+@@ -676,6 +697,8 @@ export class HtmlVideoPlayer {
+     resetSubtitleOffset() {
+         this.#currentTrackOffset = 0;
+         this.#secondaryTrackOffset = 0;
++        this.#textSubtitlePipeline?.setOffset(PRIMARY_TEXT_TRACK_INDEX, 0);
++        this.#textSubtitlePipeline?.setOffset(SECONDARY_TEXT_TRACK_INDEX, 0);
+         this.#showTrackOffset = false;
+     }
+ 
+@@ -714,24 +737,20 @@ export class HtmlVideoPlayer {
+      */
+     _setSubtitleOffset(offset) {
+         const offsetValue = parseFloat(offset);
++        const managedTrackIndex = this.#textSubtitlePipeline?.getTrackIndex(PRIMARY_TEXT_TRACK_INDEX);
+ 
+-        // if .ass currently rendering
+-        if (this.#currentAssRenderer) {
++        if (managedTrackIndex !== undefined) {
+             this.updateCurrentTrackOffset(offsetValue);
+-            this.#currentAssRenderer.timeOffset = getSubtitleTimeOffset(this._currentPlayOptions, offsetValue);
++            this.#textSubtitlePipeline.setOffset(PRIMARY_TEXT_TRACK_INDEX, offsetValue);
+         } else if (this.#currentBitmapSubRenderer) {
+             this.updateCurrentTrackOffset(offsetValue);
+             this.#currentBitmapSubRenderer.timeOffset = getSubtitleTimeOffset(this._currentPlayOptions, offsetValue);
+         } else {
+             const trackElements = this.getTextTracks();
+-            // if .vtt currently rendering
+             if (trackElements?.length > 0) {
+                 trackElements.forEach((trackElement, index) => {
+                     this.setTextTrackSubtitleOffset(trackElement, offsetValue, index);
+                 });
+-            } else if (this.#currentTrackEvents || this.#currentSecondaryTrackEvents) {
+-                this.#currentTrackEvents && this.setTrackEventsSubtitleOffset(this.#currentTrackEvents, offsetValue, PRIMARY_TEXT_TRACK_INDEX);
+-                this.#currentSecondaryTrackEvents && this.setTrackEventsSubtitleOffset(this.#currentSecondaryTrackEvents, offsetValue, SECONDARY_TEXT_TRACK_INDEX);
+             } else {
+                 this.updateCurrentTrackOffset(offsetValue);
+                 console.debug('No available track, cannot apply offset: ', offsetValue);
+@@ -827,22 +846,6 @@ export class HtmlVideoPlayer {
+         }
+     }
+ 
+-    /**
+-     * @private
+-     */
+-    setTrackEventsSubtitleOffset(trackEvents, offsetValue, currentTrackIndex) {
+-        if (Array.isArray(trackEvents)) {
+-            offsetValue = this.updateCurrentTrackOffset(offsetValue, currentTrackIndex) * 1e7; // ticks
+-            if (offsetValue === 0) {
+-                return;
+-            }
+-            trackEvents.forEach(function (trackEvent) {
+-                trackEvent.StartPositionTicks -= offsetValue;
+-                trackEvent.EndPositionTicks -= offsetValue;
+-            });
+-        }
+-    }
+-
+     getSubtitleOffset() {
+         return this.#currentTrackOffset;
+     }
+@@ -952,6 +955,7 @@ export class HtmlVideoPlayer {
+         }
+ 
+         this.destroyCustomTrack(elem);
++        this.resetTextSubtitlePipeline();
+ 
+         if (destroyPlayer) {
+             this.destroy();
+@@ -975,6 +979,10 @@ export class HtmlVideoPlayer {
+             this.#mediaElement = null;
+ 
+             this.destroyCustomTrack(videoElement);
++            this.resetTextSubtitlePipeline();
++            PLAYBACK_DIAGNOSTIC_EVENTS.forEach(eventName => {
++                videoElement.removeEventListener(eventName, this.onPlaybackDiagnosticEvent);
++            });
+             videoElement.removeEventListener('timeupdate', this.onTimeUpdate);
+             videoElement.removeEventListener('ended', this.onEnded);
+             videoElement.removeEventListener('volumechange', this.onVolumeChange);
+@@ -1037,14 +1045,6 @@ export class HtmlVideoPlayer {
+ 
+         this.#currentTime = time;
+ 
+-        const currentPlayOptions = this._currentPlayOptions;
+-        // Not sure yet how this is coming up null since we never null it out, but it is causing app crashes
+-        if (currentPlayOptions) {
+-            let timeMs = time * 1000;
+-            timeMs += ((currentPlayOptions.transcodingOffsetTicks || 0) / 10000);
+-            this.updateSubtitleText(timeMs);
+-        }
+-
+         Events.trigger(this, 'timeupdate');
+     };
+ 
+@@ -1111,11 +1111,7 @@ export class HtmlVideoPlayer {
+             loading.hide();
+ 
+             seekOnPlaybackStart(this, e.target, this._currentPlayOptions.playerStartPositionTicks, () => {
+-                if (this.#currentAssRenderer) {
+-                    this.#currentAssRenderer.timeOffset = getSubtitleTimeOffset(this._currentPlayOptions, this.#currentTrackOffset);
+-                    this.#currentAssRenderer.resize();
+-                    this.#currentAssRenderer.resetRenderAheadCache(false);
+-                }
++                this.#textSubtitlePipeline?.sync('playback-start');
+ 
+                 if (this.#currentBitmapSubRenderer) {
+                     this.#currentBitmapSubRenderer.timeOffset = getSubtitleTimeOffset(this._currentPlayOptions, this.#currentTrackOffset);
+@@ -1232,95 +1228,43 @@ export class HtmlVideoPlayer {
+         onErrorInternal(this, type);
+     };
+ 
+-    /**
+-     * @private
+-     */
+-    destroyCustomRenderedTrackElements(targetTrackIndex) {
+-        if (this.isPrimaryTrack(targetTrackIndex)) {
+-            if (this.#videoSubtitlesElem) {
+-                tryRemoveElement(this.#videoSubtitlesElem);
+-                this.#videoSubtitlesElem = null;
+-            }
+-        } else if (this.isSecondaryTrack(targetTrackIndex)) {
+-            if (this.#videoSecondarySubtitlesElem) {
+-                tryRemoveElement(this.#videoSecondarySubtitlesElem);
+-                this.#videoSecondarySubtitlesElem = null;
+-            }
+-        } else if (this.#videoSubtitlesElem) {
+-            // destroy all
+-            const subtitlesContainer = this.#videoSubtitlesElem.parentNode;
+-            if (subtitlesContainer) {
+-                tryRemoveElement(subtitlesContainer);
+-            }
+-            this.#videoSubtitlesElem = null;
+-            this.#videoSecondarySubtitlesElem = null;
+-        }
+-    }
+-
+     /**
+      * @private
+      */
+     destroyNativeTracks(videoElement, targetTrackIndex) {
+-        if (videoElement) {
+-            const destroySingleTrack = typeof targetTrackIndex === 'number';
+-            const allTracks = videoElement.textTracks || []; // get list of tracks
+-            for (let index = 0; index < allTracks.length; index++) {
+-                const track = allTracks[index];
+-                // Skip all other tracks if we are targeting just one
+-                if (destroySingleTrack && targetTrackIndex !== index) {
+-                    continue;
+-                }
+-                if (track.label.includes('manualTrack')) {
+-                    track.mode = 'disabled';
+-                }
++        if (!videoElement) return;
++
++        const destroySingleTrack = typeof targetTrackIndex === 'number';
++        const allTracks = videoElement.textTracks || [];
++        for (let index = 0; index < allTracks.length; index++) {
++            const track = allTracks[index];
++            if (destroySingleTrack && targetTrackIndex !== index) continue;
++            if (track.label.includes('manualTrack')) {
++                track.mode = 'disabled';
+             }
+         }
+     }
+ 
+-    /**
+-     * @private
+-     */
+-    destroyStoredTrackInfo(targetTrackIndex) {
+-        if (this.isPrimaryTrack(targetTrackIndex)) {
+-            this.#customTrackIndex = -1;
+-            this.#currentTrackEvents = null;
+-        } else if (this.isSecondaryTrack(targetTrackIndex)) {
+-            this.#customSecondaryTrackIndex = -1;
+-            this.#currentSecondaryTrackEvents = null;
+-        } else { // destroy all
+-            this.#customTrackIndex = -1;
+-            this.#customSecondaryTrackIndex = -1;
+-            this.#currentTrackEvents = null;
+-            this.#currentSecondaryTrackEvents = null;
+-        }
+-    }
+-
+     /**
       * @private
       */
      destroyCustomTrack(videoElement, targetTrackIndex) {
-+        const destroysAssRenderer = targetTrackIndex === undefined
-+            || this.#assRendererTargetTrackIndex === targetTrackIndex;
-+        if (destroysAssRenderer) {
-+            this.#assRendererLoadToken = undefined;
-+            this.#assRendererTargetTrackIndex = undefined;
-+        }
          if (targetTrackIndex === undefined) {
++            this.#textSubtitlePipeline?.clear();
++            this.#subtitleTrackSelectionTokens.clear();
              this.endPendingSubtitleLoad(PRIMARY_TEXT_TRACK_INDEX);
              this.endPendingSubtitleLoad(SECONDARY_TEXT_TRACK_INDEX);
-@@ -1310,11 +1325,13 @@ export class HtmlVideoPlayer {
+         } else {
++            this.#textSubtitlePipeline?.clear(targetTrackIndex);
+             this.endPendingSubtitleLoad(targetTrackIndex);
+         }
+ 
+-        this.destroyCustomRenderedTrackElements(targetTrackIndex);
          this.destroyNativeTracks(videoElement, targetTrackIndex);
-         this.destroyStoredTrackInfo(targetTrackIndex);
+-        this.destroyStoredTrackInfo(targetTrackIndex);
  
 -        const octopus = this.#currentAssRenderer;
 -        if (octopus) {
 -            octopus.dispose();
-+        if (destroysAssRenderer) {
-+            const octopus = this.#currentAssRenderer;
-+            if (octopus) {
-+                octopus.dispose();
-+            }
-+            this.#currentAssRenderer = null;
++        if (targetTrackIndex === undefined || this.isPrimaryTrack(targetTrackIndex)) {
++            this.#currentBitmapSubRenderer?.dispose();
++            this.#currentBitmapSubRenderer = null;
          }
 -        this.#currentAssRenderer = null;
+-
+-        const pgsOrVobSubRenderer = this.#currentBitmapSubRenderer;
+-        if (pgsOrVobSubRenderer) {
+-            pgsOrVobSubRenderer.dispose();
+-        }
+-        this.#currentBitmapSubRenderer = null;
+     }
  
-         const pgsOrVobSubRenderer = this.#currentBitmapSubRenderer;
-         if (pgsOrVobSubRenderer) {
-@@ -1392,80 +1409,120 @@ export class HtmlVideoPlayer {
+     /**
+@@ -1337,14 +1281,14 @@ export class HtmlVideoPlayer {
      /**
       * @private
       */
--    renderSsaAss(videoElement, track, item) {
-+    async renderSsaAss(videoElement, track, item, targetTextTrackIndex) {
-+        if (this.#currentAssRenderer) {
-+            this.#currentAssRenderer.dispose();
-+            this.#currentAssRenderer = null;
+-    async fetchSubtitles(track, item) {
++    async fetchSubtitles(track, item, signal) {
+         if (window.Windows && itemHelper.isLocalItem(item)) {
+             return this.fetchSubtitlesUwp(track, item);
+         }
+ 
+         this.incrementFetchQueue();
+         try {
+-            const response = await fetch(getTextTrackUrl(track, item, '.js'));
++            const response = await fetch(getTextTrackUrl(track, item, '.js'), { signal });
+ 
+             if (!response.ok) {
+                 throw new Error(response);
+@@ -1356,116 +1300,115 @@ export class HtmlVideoPlayer {
+         }
+     }
+ 
++    /**
++     * @private
++     */
++    getTextSubtitlePipeline(videoElement) {
++        const playbackGeneration = this.#subtitlePlaybackGeneration;
++        if (this.#textSubtitlePipeline?.videoElement !== videoElement) {
++            this.#textSubtitlePipeline?.dispose();
++            this.#textSubtitlePipeline = new HtmlVideoTextSubtitlePipeline({
++                videoElement,
++                onStateChange: ({ slot, trackIndex, state, error, restoredTrackIndex }) => {
++                    if (playbackGeneration !== this.#subtitlePlaybackGeneration) return;
++                    this.logPlaybackDiagnostic(`subtitle-${state}`, videoElement, {
++                        trackIndex,
++                        playbackGeneration,
++                        restoredTrackIndex,
++                        error: error instanceof Error ? error.message : undefined
++                    });
++                    if (state === 'failed' && restoredTrackIndex !== undefined) {
++                        queueMicrotask(() => {
++                            if (playbackGeneration !== this.#subtitlePlaybackGeneration) return;
++                            if (this.#textSubtitlePipeline?.getTrackIndex(slot) !== (restoredTrackIndex < 0 ? undefined : restoredTrackIndex)) return;
++
++                            if (this.isSecondaryTrack(slot)) {
++                                playbackManager.setSecondarySubtitleStreamIndex(restoredTrackIndex, this);
++                            } else {
++                                playbackManager.setSubtitleStreamIndex(restoredTrackIndex, this);
++                            }
++                        });
++                    }
++                },
++                getPlaybackOptions: () => this._currentPlayOptions,
++                getSubtitleUrl: (track, item) => getTextTrackUrl(track, item),
++                fetchSubtitleData: (track, item, signal) => this.fetchSubtitles(track, item, signal),
++                resolveUrl,
++                applyAppearance: (container, textElement) => {
++                    this.setSubtitleAppearance(container, textElement);
++                },
++                secondaryBeforePrimary: () => {
++                    const appearance = userSettings.getSubtitleAppearanceSettings();
++                    return parseInt(appearance.verticalPosition, 10) < 0;
++                },
++                onAssError: (error) => {
++                    if (playbackGeneration !== this.#subtitlePlaybackGeneration) return;
++                    console.error('Unable to initialize managed ASS subtitles', error);
++                }
++            });
 +        }
 +
-         const supportedFonts = ['application/vnd.ms-opentype', 'application/x-truetype-font', 'font/otf', 'font/ttf', 'font/woff', 'font/woff2'];
++        return this.#textSubtitlePipeline;
++    }
++
++    /**
++     * Ends the current subtitle playback generation and releases every clock,
++     * renderer, worker, pending selection, and frame callback owned by it.
++     * @private
++     */
++    resetTextSubtitlePipeline() {
++        this.#subtitlePlaybackGeneration++;
++        this.#textSubtitlePipeline?.dispose();
++        this.#textSubtitlePipeline = null;
++        this.#subtitleTrackSelectionTokens.clear();
++    }
++
++    /**
++     * @private
++     */
++    shouldUseManagedTextRenderer(track, item) {
++        if (itemHelper.isLocalItem(item) && !track.IsExternal) return false;
++
++        const format = (track.Codec || '').toLowerCase();
++        if (format === 'pgssub' || VOBSUB_SUBTITLE_CODECS.includes(format)) return false;
++        return ASS_SUBTITLE_CODECS.includes(format)
++            || SRT_SUBTITLE_CODECS.includes(format)
++            || useCustomSubtitles(userSettings);
++    }
++
+     /**
+      * @private
+      */
+     setTrackForDisplay(videoElement, track, targetTextTrackIndex = PRIMARY_TEXT_TRACK_INDEX) {
+         if (!track) {
+-            // Destroy all tracks by passing undefined if there is no valid primary track
+             this.destroyCustomTrack(videoElement, this.isSecondaryTrack(targetTextTrackIndex) ? targetTextTrackIndex : undefined);
+             return;
+         }
+ 
+-        let targetTrackIndex = this.#customTrackIndex;
+-        if (this.isSecondaryTrack(targetTextTrackIndex)) {
+-            targetTrackIndex = this.#customSecondaryTrackIndex;
+-        }
+-
+-        // skip if already playing this track
+-        if (targetTrackIndex === track.Index) {
++        const item = this._currentPlayOptions.item;
++        if (!this.shouldUseManagedTextRenderer(track, item)) {
++            this.destroyCustomTrack(videoElement, targetTextTrackIndex);
++            this.renderLegacyTrack(videoElement, track, item, targetTextTrackIndex).catch(error => {
++                console.error('Failed to load subtitle track', error);
++            });
+             return;
+         }
+ 
+-        this.resetSubtitleOffset();
+-        const item = this._currentPlayOptions.item;
+-
+-        this.destroyCustomTrack(videoElement, targetTextTrackIndex);
++        const pipeline = this.getTextSubtitlePipeline(videoElement);
+ 
+-        if (this.isSecondaryTrack(targetTextTrackIndex)) {
+-            this.#customSecondaryTrackIndex = track.Index;
++        this.destroyNativeTracks(videoElement, targetTextTrackIndex);
++        this.endPendingSubtitleLoad(targetTextTrackIndex);
++        if (this.isPrimaryTrack(targetTextTrackIndex)) {
++            this.#currentBitmapSubRenderer?.dispose();
++            this.#currentBitmapSubRenderer = null;
++            this.#currentTrackOffset = 0;
++            pipeline.setOffset(PRIMARY_TEXT_TRACK_INDEX, 0);
+         } else {
+-            this.#customTrackIndex = track.Index;
++            this.#secondaryTrackOffset = 0;
++            pipeline.setOffset(SECONDARY_TEXT_TRACK_INDEX, 0);
+         }
+-        this.renderTracksEvents(videoElement, track, item, targetTextTrackIndex);
+-    }
+ 
+-    /**
+-     * @private
+-     */
+-    renderSsaAss(videoElement, track, item) {
+-        const supportedFonts = ['application/vnd.ms-opentype', 'application/x-truetype-font', 'font/otf', 'font/ttf', 'font/woff', 'font/woff2'];
 -        const availableFonts = [];
 -        const attachments = this._currentPlayOptions.mediaSource.MediaAttachments || [];
-+        const playOptions = this._currentPlayOptions;
-+        const mediaSource = playOptions.mediaSource;
-+        const videoStream = getMediaStreamVideoTracks(mediaSource)[0];
-         const apiClient = ServerConnections.getApiClient(item);
+-        const apiClient = ServerConnections.getApiClient(item);
 -        attachments.forEach(i => {
-+        const loadToken = Symbol(String(track.Index));
-+        this.#assRendererLoadToken = loadToken;
-+        this.#assRendererTargetTrackIndex = targetTextTrackIndex;
-+        const embeddedFonts = [];
-+        (mediaSource.MediaAttachments || []).forEach(i => {
-             // we only require font files and ignore embedded media attachments like covers as there are cases where ffmpeg fails to extract those
-             if (supportedFonts.includes(i.MimeType)) {
-                 // embedded font url
+-            // we only require font files and ignore embedded media attachments like covers as there are cases where ffmpeg fails to extract those
+-            if (supportedFonts.includes(i.MimeType)) {
+-                // embedded font url
 -                availableFonts.push(apiClient.getUrl(i.DeliveryUrl));
-+                embeddedFonts.push(apiClient.getUrl(i.DeliveryUrl));
-             }
-         });
-         const fallbackFontList = apiClient.getUrl('/FallbackFont/Fonts', {
-             ApiKey: apiClient.accessToken()
-         });
-         const htmlVideoPlayer = this;
+-            }
+-        });
+-        const fallbackFontList = apiClient.getUrl('/FallbackFont/Fonts', {
+-            ApiKey: apiClient.accessToken()
+-        });
+-        const htmlVideoPlayer = this;
 -        import('@jellyfin/libass-wasm').then(({ default: SubtitlesOctopus }) => {
 -            const mediaSource = this._currentPlayOptions.mediaSource;
 -            const videoStream = getMediaStreamVideoTracks(mediaSource)[0];
@@ -640,109 +1158,296 @@ index 4a5951b47b..6d3c14aa87 100644
 -                } else {
 -                    this.#currentAssRenderer = new SubtitlesOctopus(options);
 -                }
-+        const workerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`;
-+        const legacyWorkerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`;
-+        const [
-+            { default: SubtitlesOctopus },
-+            config,
-+            resolvedWorkerUrl,
-+            resolvedLegacyWorkerUrl,
-+            subtitleFontBridge
-+        ] = await Promise.all([
-+            import('@jellyfin/libass-wasm'),
-+            apiClient.getNamedConfiguration('encoding'),
-+            // Worker in Tizen 5 doesn't resolve relative path with async request
-+            resolveUrl(workerUrl),
-+            resolveUrl(legacyWorkerUrl),
-+            resolveSubtitleFontBridge(apiClient, item.Id, mediaSource.Id, track.Index)
-+        ]);
-+
-+        if (this.#assRendererLoadToken !== loadToken) return;
-+
-+        // Preload the Bridge's small, exact system-font set. Do not use
-+        // libass' lazy-file mode here: its synchronous range-request path is
-+        // not reliable for controller-hosted plugin files.
-+        const resolvedFonts = [ ...subtitleFontBridge.fontUrls ];
-+
-+        if (config.EnableFallbackFont) {
-+            const fontFiles = await apiClient.getJSON(fallbackFontList);
-+            if (this.#assRendererLoadToken !== loadToken) return;
-+
-+            (fontFiles || []).forEach(font => {
-+                const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
-+                    ApiKey: apiClient.accessToken()
-+                });
-+                resolvedFonts.push(fontUrl);
-             });
-+        }
-+
-+        const embeddedFallbackFonts = [ ...new Set([ ...embeddedFonts, ...resolvedFonts ]) ];
-+        const createOptions = (fonts, retryWithEmbeddedFonts) => ({
-+            video: videoElement,
-+            subUrl: getTextTrackUrl(track, item),
-+            fonts,
-+            workerUrl: resolvedWorkerUrl,
-+            legacyWorkerUrl: resolvedLegacyWorkerUrl,
-+            onError() {
-+                if (htmlVideoPlayer.#assRendererLoadToken !== loadToken) return;
-+
-+                // HACK: Clear JavascriptSubtitlesOctopus: it gets disposed when an error occurs
-+                htmlVideoPlayer.#currentAssRenderer = null;
-+
-+                // HACK: Give JavascriptSubtitlesOctopus time to dispose itself
-+                setTimeout(() => {
-+                    if (htmlVideoPlayer.#assRendererLoadToken !== loadToken) return;
-+
-+                    if (retryWithEmbeddedFonts) {
-+                        console.warn('Subtitle Font Bridge rendering failed; retrying with embedded fonts.');
-+                        htmlVideoPlayer.#currentAssRenderer = new SubtitlesOctopus(
-+                            createOptions(embeddedFallbackFonts, false)
-+                        );
-+                        return;
-+                    }
-+
-+                    onErrorInternal(this, MediaError.ASS_RENDER_ERROR);
-+                }, 0);
-+            },
-+            timeOffset: (playOptions.transcodingOffsetTicks || 0) / 10000000,
-+
-+            // new octopus options; override all, even defaults
-+            renderMode: 'wasm-blend',
-+            dropAllAnimations: false,
-+            libassMemoryLimit: 40,
-+            libassGlyphLimit: 40,
-+            targetFps: videoStream?.ReferenceFrameRate || 24,
-+            prescaleFactor: 0.8,
-+            prescaleHeightLimit: 1080,
-+            maxRenderHeight: 2160,
-+            resizeVariation: 0.2,
-+            renderAhead: 90
-         });
-+
-+        const useBridgeOnly = subtitleFontBridge.fullyResolved;
-+        const options = createOptions(
-+            useBridgeOnly ? [ ...new Set(resolvedFonts) ] : embeddedFallbackFonts,
-+            useBridgeOnly && embeddedFonts.length > 0
-+        );
-+
-+        if (this.#assRendererLoadToken === loadToken) {
-+            this.#currentAssRenderer = new SubtitlesOctopus(options);
-+        }
+-            });
+-        });
++        void pipeline.select(targetTextTrackIndex, track);
      }
  
      /**
-@@ -1630,7 +1687,7 @@ export class HtmlVideoPlayer {
+@@ -1491,7 +1434,9 @@ export class HtmlVideoPlayer {
+                 console.debug('[libbitsub] pgs', event);
+             }
+         };
++        const pendingToken = this.#pendingSubtitleLoads.get(targetTextTrackIndex)?.token;
+         import('libbitsub').then((libbitsub) => {
++            if (this.#pendingSubtitleLoads.get(targetTextTrackIndex)?.token !== pendingToken) return;
+             this.#currentBitmapSubRenderer = new libbitsub.PgsRenderer(options);
+             requestAnimationFrame(() => {
+                 if (this.#currentBitmapSubRenderer) {
+@@ -1533,7 +1478,9 @@ export class HtmlVideoPlayer {
+                 console.debug('[libbitsub] vobsub', event);
+             }
+         };
++        const pendingToken = this.#pendingSubtitleLoads.get(targetTextTrackIndex)?.token;
+         import('libbitsub').then((libbitsub) => {
++            if (this.#pendingSubtitleLoads.get(targetTextTrackIndex)?.token !== pendingToken) return;
+             this.#currentBitmapSubRenderer = new libbitsub.VobSubRenderer(options);
+             requestAnimationFrame(() => {
+                 if (this.#currentBitmapSubRenderer) {
+@@ -1546,48 +1493,6 @@ export class HtmlVideoPlayer {
+         });
+     }
+ 
+-    /**
+-     * @private
+-     */
+-    renderSubtitlesWithCustomElement(videoElement, track, item, targetTextTrackIndex) {
+-        this.fetchSubtitles(track, item).then((subtitleData) => {
+-            // Exit if the video element was destroyed while fetching subtitles
+-            if (!this.#mediaElement) return;
+-
+-            const subtitleAppearance = userSettings.getSubtitleAppearanceSettings();
+-            const subtitleVerticalPosition = parseInt(subtitleAppearance.verticalPosition, 10);
+-
+-            if (!this.#videoSubtitlesElem && !this.isSecondaryTrack(targetTextTrackIndex)) {
+-                let subtitlesContainer = document.querySelector('.videoSubtitles');
+-                if (!subtitlesContainer) {
+-                    subtitlesContainer = document.createElement('div');
+-                    subtitlesContainer.classList.add('videoSubtitles');
+-                }
+-                const subtitlesElement = document.createElement('div');
+-                subtitlesElement.classList.add('videoSubtitlesInner');
+-                subtitlesContainer.appendChild(subtitlesElement);
+-                this.#videoSubtitlesElem = subtitlesElement;
+-                this.setSubtitleAppearance(subtitlesContainer, this.#videoSubtitlesElem);
+-                videoElement.parentNode.appendChild(subtitlesContainer);
+-                this.#currentTrackEvents = subtitleData.TrackEvents;
+-            } else if (!this.#videoSecondarySubtitlesElem && this.isSecondaryTrack(targetTextTrackIndex)) {
+-                const subtitlesContainer = document.querySelector('.videoSubtitles');
+-                if (!subtitlesContainer) return;
+-                const secondarySubtitlesElement = document.createElement('div');
+-                secondarySubtitlesElement.classList.add('videoSecondarySubtitlesInner');
+-                // determine the order of the subtitles
+-                if (subtitleVerticalPosition < 0) {
+-                    subtitlesContainer.insertBefore(secondarySubtitlesElement, subtitlesContainer.firstChild);
+-                } else {
+-                    subtitlesContainer.appendChild(secondarySubtitlesElement);
+-                }
+-                this.#videoSecondarySubtitlesElem = secondarySubtitlesElement;
+-                this.setSubtitleAppearance(subtitlesContainer, this.#videoSecondarySubtitlesElem);
+-                this.#currentSecondaryTrackEvents = subtitleData.TrackEvents;
+-            }
+-        });
+-    }
+-
+     /**
+      * @private
+      */
+@@ -1626,13 +1531,9 @@ export class HtmlVideoPlayer {
+     /**
+      * @private
+      */
+-    async renderTracksEvents(videoElement, track, item, targetTextTrackIndex = PRIMARY_TEXT_TRACK_INDEX) {
++    async renderLegacyTrack(videoElement, track, item, targetTextTrackIndex) {
++        const format = (track.Codec || '').toLowerCase();
          if (!itemHelper.isLocalItem(item) || track.IsExternal) {
-             const format = (track.Codec || '').toLowerCase();
-             if (ASS_SUBTITLE_CODECS.includes(format)) {
+-            const format = (track.Codec || '').toLowerCase();
+-            if (ASS_SUBTITLE_CODECS.includes(format)) {
 -                this.renderSsaAss(videoElement, track, item);
-+                this.renderSsaAss(videoElement, track, item, targetTextTrackIndex);
+-                return;
+-            }
+             if (format === 'pgssub') {
+                 this.renderPgs(videoElement, track, item, targetTextTrackIndex);
+                 return;
+@@ -1641,98 +1542,53 @@ export class HtmlVideoPlayer {
+                 this.renderVobSub(videoElement, track, item, targetTextTrackIndex);
                  return;
              }
-             if (format === 'pgssub') {
+-
+-            if (useCustomSubtitles(userSettings)) {
+-                this.renderSubtitlesWithCustomElement(videoElement, track, item, targetTextTrackIndex);
+-                return;
+-            }
+         }
+ 
+         let trackElement = null;
+-        const updatingTrack = videoElement.textTracks && videoElement.textTracks.length > (this.isSecondaryTrack(targetTextTrackIndex) ? 1 : 0);
++        const updatingTrack = videoElement.textTracks
++            && videoElement.textTracks.length > (this.isSecondaryTrack(targetTextTrackIndex) ? 1 : 0);
+         if (updatingTrack) {
+             trackElement = videoElement.textTracks[targetTextTrackIndex];
+-            // This throws an error in IE, but is fine in chrome
+-            // In IE it's not necessary anyway because changing the src seems to be enough
+             try {
+                 trackElement.mode = 'showing';
+                 while (trackElement.cues.length) {
+                     trackElement.removeCue(trackElement.cues[0]);
+                 }
+-            } catch (e) {
+-                console.error('error removing cue from textTrack', e);
++            } catch (error) {
++                console.error('Error removing cue from text track', error);
+             }
+-
+             trackElement.mode = 'disabled';
+         } else {
+-            // There is a function addTextTrack but no function for removeTextTrack
+-            // Therefore we add ONE element and replace its cue data
+             trackElement = videoElement.addTextTrack('subtitles', 'manualTrack', 'und');
+         }
+ 
+-        // download the track json
+-        this.fetchSubtitles(track, item).then(data => {
+-            // Exit if the video element was destroyed while fetching subtitles
+-            if (!this.#mediaElement) return;
+-
+-            console.debug(`downloaded ${data.TrackEvents.length} track events`);
+-
+-            const subtitleAppearance = userSettings.getSubtitleAppearanceSettings();
+-            const cueLine = parseInt(subtitleAppearance.verticalPosition, 10);
+-
+-            // add some cues to show the text
+-            // in safari, the cues need to be added before setting the track mode to showing
+-            for (const trackEvent of data.TrackEvents) {
+-                const TrackCue = window.VTTCue || window.TextTrackCue;
+-                const text = normalizeTrackEventText(trackEvent.Text, false);
+-                const cue = new TrackCue(trackEvent.StartPositionTicks / 10000000, trackEvent.EndPositionTicks / 10000000, text);
+-
+-                if (cue.line === 'auto') {
+-                    if (cueLine < 0) {
+-                        const lineCount = (text.match(/\n/g) || []).length;
+-                        cue.line = cueLine - lineCount;
+-                    } else {
+-                        cue.line = cueLine;
+-                    }
+-                }
+-
+-                trackElement.addCue(cue);
+-            }
+-
+-            trackElement.mode = 'showing';
+-        });
+-    }
+-
+-    /**
+-     * @private
+-     */
+-    updateSubtitleText(timeMs) {
+-        const allTrackEvents = [this.#currentTrackEvents, this.#currentSecondaryTrackEvents];
+-        const subtitleTextElements = [this.#videoSubtitlesElem, this.#videoSecondarySubtitlesElem];
+-
+-        for (let i = 0; i < allTrackEvents.length; i++) {
+-            const trackEvents = allTrackEvents[i];
+-            const subtitleTextElement = subtitleTextElements[i];
+-
+-            if (trackEvents && subtitleTextElement) {
+-                const ticks = timeMs * 10000;
+-                let selectedTrackEvent;
+-                for (const trackEvent of trackEvents) {
+-                    if (trackEvent.StartPositionTicks <= ticks && trackEvent.EndPositionTicks >= ticks) {
+-                        selectedTrackEvent = trackEvent;
+-                        break;
+-                    }
+-                }
+-
+-                if (selectedTrackEvent?.Text) {
+-                    subtitleTextElement.innerHTML = DOMPurify.sanitize(
+-                        normalizeTrackEventText(selectedTrackEvent.Text, true));
+-                    subtitleTextElement.classList.remove('hide');
++        const selectionToken = this.#subtitleTrackSelectionTokens.get(targetTextTrackIndex);
++        const data = await this.fetchSubtitles(track, item);
++        if (selectionToken !== this.#subtitleTrackSelectionTokens.get(targetTextTrackIndex)) return;
++
++        const subtitleAppearance = userSettings.getSubtitleAppearanceSettings();
++        const cueLine = parseInt(subtitleAppearance.verticalPosition, 10);
++        for (const trackEvent of data.TrackEvents) {
++            const TrackCue = window.VTTCue || window.TextTrackCue;
++            const text = normalizeTrackEventText(trackEvent.Text, false);
++            const cue = new TrackCue(
++                trackEvent.StartPositionTicks / 10_000_000,
++                trackEvent.EndPositionTicks / 10_000_000,
++                text
++            );
++
++            if (cue.line === 'auto') {
++                if (cueLine < 0) {
++                    const lineCount = (text.match(/\n/g) || []).length;
++                    cue.line = cueLine - lineCount;
+                 } else {
+-                    subtitleTextElement.classList.add('hide');
++                    cue.line = cueLine;
+                 }
+             }
++            trackElement.addCue(cue);
+         }
++
++        trackElement.mode = 'showing';
+     }
+ 
+     /**
+@@ -1740,13 +1596,15 @@ export class HtmlVideoPlayer {
+      */
+     setCurrentTrackElement(streamIndex, targetTextTrackIndex) {
+         console.debug(`setting new text track index to: ${streamIndex}`);
++        const subtitleTarget = targetTextTrackIndex ?? PRIMARY_TEXT_TRACK_INDEX;
++        const selectionToken = Symbol(String(streamIndex));
++        this.#subtitleTrackSelectionTokens.set(subtitleTarget, selectionToken);
+ 
+         const mediaStreamTextTracks = getMediaStreamTextTracks(this._currentPlayOptions.mediaSource);
+ 
+         let track = streamIndex === -1 ? null : mediaStreamTextTracks.filter(function (t) {
+             return t.Index === streamIndex;
+         })[0];
+-
+         // This play method can only check if it is real direct play, and will mark Remux as Transcode as well
+         const isDirectPlay = this._currentPlayOptions.playMethod === 'DirectPlay';
+         const burnInWhenTranscoding = appSettings.alwaysBurnInSubtitleWhenTranscoding();
+@@ -1768,12 +1626,17 @@ export class HtmlVideoPlayer {
+         const player = this;
+ 
+         sessionPromise.then((s) => {
++            const staleSelection = player.#subtitleTrackSelectionTokens.get(subtitleTarget) !== selectionToken;
++            if (staleSelection) {
++                return;
++            }
++
+             if (!s.TranscodingInfo || s.TranscodingInfo.IsVideoDirect) {
+                 // restore recorded delivery method if any
+                 mediaStreamTextTracks.forEach((t) => {
+                     t.DeliveryMethod = t.realDeliveryMethod ?? t.DeliveryMethod;
+                 });
+-                player.setTrackForDisplay(player.#mediaElement, track, targetTextTrackIndex);
++                player.setTrackForDisplay(player.#mediaElement, track, subtitleTarget);
+                 if (enableNativeTrackSupport(player._currentPlayOptions?.mediaSource, track)) {
+                     if (streamIndex !== -1) {
+                         player.setCueAppearance();
+@@ -1840,6 +1703,9 @@ export class HtmlVideoPlayer {
+                 videoElement.addEventListener('timeupdate', this.onTimeUpdate);
+                 videoElement.addEventListener('ended', this.onEnded);
+                 videoElement.addEventListener('volumechange', this.onVolumeChange);
++                PLAYBACK_DIAGNOSTIC_EVENTS.forEach(eventName => {
++                    videoElement.addEventListener(eventName, this.onPlaybackDiagnosticEvent);
++                });
+                 videoElement.addEventListener('pause', this.onPause);
+                 videoElement.addEventListener('playing', this.onPlaying);
+                 videoElement.addEventListener('play', this.onPlay);
+diff --git a/src/plugins/htmlVideoPlayer/style.scss b/src/plugins/htmlVideoPlayer/style.scss
+index 1ee7b95f6003574cd13c467060048ff5628b4acf..07955960310f7444aa85139f936f011b1f57bec6 100644
+--- a/src/plugins/htmlVideoPlayer/style.scss
++++ b/src/plugins/htmlVideoPlayer/style.scss
+@@ -17,6 +17,19 @@
+     order: -1;
+ }
+ 
++// Managed ASS renderers must never become flex items. A flex sibling can
++// temporarily resize the video while SRT and ASS renderers are atomically
++// swapped, producing a visible layout jump.
++.videoPlayerContainer .subtitle-pipeline-ass {
++    position: absolute;
++    inset: 0;
++    width: 100%;
++    height: 100%;
++    overflow: hidden;
++    pointer-events: none;
++    z-index: 1;
++}
++
+ /* Controls are enabled for devices that don't support autoplay. They will be hidden when playback starts.
+    In Tizen 2.3 (and probably other old web engines), subtitles are located under '-webkit-media-controls' tree.
+    Therefore, we hide controls only if they are enabled.
 diff --git a/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts b/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts
 new file mode 100644
-index 0000000000..b3081bf406
+index 0000000000000000000000000000000000000000..b3081bf406caeb7164be3e30f1ed86fe64a7859c
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts
 @@ -0,0 +1,133 @@
@@ -880,7 +1585,7 @@ index 0000000000..b3081bf406
 +    }
 +}
 diff --git a/src/styles/videoosd.scss b/src/styles/videoosd.scss
-index 9b7c25d8de..db11b793ef 100644
+index 9b7c25d8def0d1cf4986a6eeeeb0bddd32d2384f..db11b793ef280a1949fd2141f73ca18aff16c800 100644
 --- a/src/styles/videoosd.scss
 +++ b/src/styles/videoosd.scss
 @@ -112,6 +112,41 @@
@@ -927,7 +1632,7 @@ index 9b7c25d8de..db11b793ef 100644
      flex-grow: 1;
 diff --git a/src/utils/subtitleFontBridgeResolver.test.ts b/src/utils/subtitleFontBridgeResolver.test.ts
 new file mode 100644
-index 0000000000..47e296d7b0
+index 0000000000000000000000000000000000000000..47e296d7b0cbd639532c4c8d288a8c9f655cc8b5
 --- /dev/null
 +++ b/src/utils/subtitleFontBridgeResolver.test.ts
 @@ -0,0 +1,121 @@
@@ -1052,3 +1757,2437 @@ index 0000000000..47e296d7b0
 +        await expect(resultPromise).resolves.toEqual({ fontUrls: [], fullyResolved: false });
 +    });
 +});
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/HtmlVideoTextSubtitlePipeline.test.ts b/src/plugins/htmlVideoPlayer/subtitles/HtmlVideoTextSubtitlePipeline.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6bf816281d0d7d69f628667c87ae232f47f2e31
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/HtmlVideoTextSubtitlePipeline.test.ts
+@@ -0,0 +1,98 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++vi.mock('lib/jellyfin-apiclient', () => ({
++    ServerConnections: {
++        getApiClient: vi.fn()
++    }
++}));
++vi.mock('../../../components/router/appRouter', () => ({
++    appRouter: {
++        baseUrl: () => ''
++    }
++}));
++vi.mock('../subtitleFontBridgeResolver', () => ({
++    resolveSubtitleFontBridge: vi.fn()
++}));
++
++import { HtmlVideoTextSubtitlePipeline } from './HtmlVideoTextSubtitlePipeline';
++
++function createPipeline(
++    fetchSubtitleData: (signal?: AbortSignal) => Promise<never>,
++    onStateChange = vi.fn()
++) {
++    const parent = document.createElement('div');
++    const video = document.createElement('video');
++    parent.appendChild(video);
++
++    return new HtmlVideoTextSubtitlePipeline({
++        videoElement: video,
++        onStateChange,
++        getPlaybackOptions: () => ({
++            item: { Id: 'item', ServerId: 'server' },
++            mediaSource: { Id: 'source', MediaStreams: [] }
++        }),
++        getSubtitleUrl: () => '/subtitle',
++        fetchSubtitleData: (_track, _item, signal) => fetchSubtitleData(signal),
++        resolveUrl: async url => url,
++        applyAppearance: () => undefined,
++        secondaryBeforePrimary: () => false,
++        onAssError: () => undefined
++    });
++}
++
++afterEach(() => {
++    vi.useRealTimers();
++    vi.restoreAllMocks();
++});
++
++describe('HtmlVideoTextSubtitlePipeline', () => {
++    it('aborts an unfinished text-subtitle request when the slot is cleared', async () => {
++        let requestSignal: AbortSignal | undefined;
++        const fetchSubtitleData = vi.fn((signal?: AbortSignal) => new Promise<never>((_resolve, reject) => {
++            requestSignal = signal;
++            signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
++        }));
++        const pipeline = createPipeline(fetchSubtitleData);
++
++        const selection = pipeline.select(0, { Index: 2, Codec: 'srt' });
++        await vi.waitFor(() => expect(requestSignal).toBeDefined());
++        pipeline.clear(0);
++        await selection;
++
++        expect(requestSignal?.aborted).toBe(true);
++        expect(pipeline.getTrackIndex(0)).toBeUndefined();
++        pipeline.dispose();
++    });
++
++    it('aborts and reports a text-subtitle request that exceeds the timeout', async () => {
++        vi.useFakeTimers();
++        vi.spyOn(console, 'error').mockImplementation(() => undefined);
++        let requestSignal: AbortSignal | undefined;
++        const onStateChange = vi.fn();
++        const fetchSubtitleData = vi.fn((signal?: AbortSignal) => new Promise<never>((_resolve, reject) => {
++            requestSignal = signal;
++            signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
++        }));
++        const pipeline = createPipeline(fetchSubtitleData, onStateChange);
++
++        const selection = pipeline.select(0, { Index: 3, Codec: 'srt' });
++        for (let index = 0; index < 4 && !requestSignal; index++) {
++            await Promise.resolve();
++        }
++        expect(requestSignal).toBeDefined();
++
++        await vi.advanceTimersByTimeAsync(30_000);
++        await selection;
++
++        expect(requestSignal?.aborted).toBe(true);
++        expect(onStateChange).toHaveBeenLastCalledWith(expect.objectContaining({
++            trackIndex: 3,
++            state: 'failed',
++            restoredTrackIndex: -1,
++            error: expect.objectContaining({
++                message: 'Subtitle request timed out after 30 seconds.'
++            })
++        }));
++        pipeline.dispose();
++    });
++});
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/HtmlVideoTextSubtitlePipeline.ts b/src/plugins/htmlVideoPlayer/subtitles/HtmlVideoTextSubtitlePipeline.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..223cf0acc5d8d8c4f9f112c698f3599684b8ef02
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/HtmlVideoTextSubtitlePipeline.ts
+@@ -0,0 +1,260 @@
++import { ServerConnections } from 'lib/jellyfin-apiclient';
++
++import { appRouter } from '../../../components/router/appRouter';
++import { resolveSubtitleFontBridge } from '../subtitleFontBridgeResolver';
++import { TextSubtitlePipeline } from './TextSubtitlePipeline';
++import { createAssRendererAdapter } from './renderers/AssRendererAdapter';
++import { TextEventRenderer } from './renderers/TextEventRenderer';
++import type {
++    SubtitleLoadRequest,
++    SubtitlePipelineStateChange,
++    SubtitleRenderer,
++    SubtitleSlot,
++    SubtitleTrackEvent
++} from './types';
++
++const ASS_SUBTITLE_CODECS = [ 'ssa', 'ass' ];
++const SUBTITLE_DATA_TIMEOUT_MS = 30_000;
++const SUPPORTED_FONT_MIME_TYPES = [
++    'application/vnd.ms-opentype',
++    'application/x-truetype-font',
++    'font/otf',
++    'font/ttf',
++    'font/woff',
++    'font/woff2'
++];
++
++interface SubtitleTrack {
++    Index: number;
++    Codec?: string | null;
++}
++
++interface MediaAttachment {
++    MimeType?: string | null;
++    DeliveryUrl: string;
++}
++
++interface MediaStream {
++    Type?: string | null;
++    ReferenceFrameRate?: number | null;
++}
++
++interface MediaSource {
++    Id: string;
++    MediaAttachments?: MediaAttachment[] | null;
++    MediaStreams: MediaStream[];
++}
++
++interface PlaybackItem {
++    Id: string;
++    ServerId: string;
++}
++
++interface PlaybackOptions {
++    item: PlaybackItem;
++    mediaSource: MediaSource;
++    transcodingOffsetTicks?: number | null;
++}
++
++interface SubtitleData {
++    TrackEvents?: SubtitleTrackEvent[] | null;
++}
++
++interface HtmlVideoTextSubtitlePipelineOptions {
++    videoElement: HTMLVideoElement;
++    onStateChange?(change: SubtitlePipelineStateChange): void;
++    getPlaybackOptions(): PlaybackOptions;
++    getSubtitleUrl(track: SubtitleTrack, item: PlaybackItem): string;
++    fetchSubtitleData(track: SubtitleTrack, item: PlaybackItem, signal?: AbortSignal): Promise<SubtitleData>;
++    resolveUrl(url: string): Promise<string>;
++    applyAppearance(container: HTMLElement, textElement: HTMLElement): void;
++    secondaryBeforePrimary(): boolean;
++    onAssError(error: unknown): void;
++}
++
++interface RendererAttemptState {
++    useAssFallbackFonts: boolean;
++}
++
++export class HtmlVideoTextSubtitlePipeline {
++    readonly options: HtmlVideoTextSubtitlePipelineOptions;
++    readonly pipeline: TextSubtitlePipeline;
++
++    constructor(options: HtmlVideoTextSubtitlePipelineOptions) {
++        this.options = options;
++        this.pipeline = new TextSubtitlePipeline(options.videoElement, {
++            onStateChange: change => {
++                const { trackIndex, state, error } = change;
++                if (state === 'failed') {
++                    console.error(`Failed to load subtitle track ${trackIndex}`, error);
++                }
++                this.options.onStateChange?.(change);
++            }
++        });
++    }
++
++    get videoElement() {
++        return this.pipeline.videoElement;
++    }
++
++    getTrackIndex(slot: SubtitleSlot) {
++        return this.pipeline.getTrackIndex(slot);
++    }
++
++    select(slot: SubtitleSlot, track: SubtitleTrack) {
++        const playbackOptions = this.options.getPlaybackOptions();
++        const attemptState: RendererAttemptState = {
++            useAssFallbackFonts: false
++        };
++        return this.pipeline.select(slot, track.Index, request => (
++            this.createRenderer(slot, track, playbackOptions, request, attemptState)
++        ));
++    }
++
++    setOffset(slot: SubtitleSlot, offsetSeconds: number) {
++        this.pipeline.setOffset(slot, offsetSeconds);
++    }
++
++    sync() {
++        this.pipeline.sync();
++    }
++
++    clear(slot?: SubtitleSlot) {
++        this.pipeline.clear(slot);
++    }
++
++    dispose() {
++        this.pipeline.dispose();
++    }
++
++    async createRenderer(
++        slot: SubtitleSlot,
++        track: SubtitleTrack,
++        playbackOptions: PlaybackOptions,
++        request: SubtitleLoadRequest,
++        attemptState: RendererAttemptState
++    ) {
++        const format = (track.Codec || '').toLowerCase();
++        if (ASS_SUBTITLE_CODECS.includes(format)) {
++            return this.createAssRenderer(track, playbackOptions, request, attemptState);
++        }
++
++        // Jellyfin's legacy entry point installs abortcontroller-polyfill.
++        // eslint-disable-next-line compat/compat
++        const controller = new AbortController();
++        let timedOut = false;
++        const timeout = window.setTimeout(() => {
++            timedOut = true;
++            controller.abort();
++        }, SUBTITLE_DATA_TIMEOUT_MS);
++        const unsubscribeCancel = request.onCancel(() => controller.abort());
++        let subtitleData: SubtitleData;
++        try {
++            subtitleData = await this.options.fetchSubtitleData(
++                track,
++                playbackOptions.item,
++                controller.signal
++            );
++        } catch (error) {
++            if (timedOut) {
++                throw new Error(`Subtitle request timed out after ${SUBTITLE_DATA_TIMEOUT_MS / 1000} seconds.`);
++            }
++            throw error;
++        } finally {
++            window.clearTimeout(timeout);
++            unsubscribeCancel();
++        }
++        if (!request.isCurrent()) {
++            throw new Error('Subtitle load was cancelled');
++        }
++
++        const parentElement = this.videoElement.parentElement;
++        if (!parentElement) {
++            throw new Error('Unable to attach the text subtitle renderer');
++        }
++
++        return new TextEventRenderer({
++            parentElement,
++            slot,
++            trackEvents: subtitleData.TrackEvents || [],
++            baseTimeOffsetSeconds: (playbackOptions.transcodingOffsetTicks || 0) / 10_000_000,
++            secondaryBeforePrimary: this.options.secondaryBeforePrimary(),
++            applyAppearance: this.options.applyAppearance
++        });
++    }
++
++    async createAssRenderer(
++        track: SubtitleTrack,
++        playbackOptions: PlaybackOptions,
++        request: SubtitleLoadRequest,
++        attemptState: RendererAttemptState
++    ): Promise<SubtitleRenderer> {
++        const { item, mediaSource } = playbackOptions;
++        const apiClient = ServerConnections.getApiClient(item.ServerId);
++        if (!apiClient) {
++            throw new Error('Unable to resolve the Jellyfin API client');
++        }
++        const videoStream = mediaSource.MediaStreams.find(stream => stream.Type === 'Video');
++        const embeddedFonts = (mediaSource.MediaAttachments || [])
++            .filter(attachment => attachment.MimeType && SUPPORTED_FONT_MIME_TYPES.includes(attachment.MimeType))
++            .map(attachment => apiClient.getUrl(attachment.DeliveryUrl));
++        const fallbackFontList = apiClient.getUrl('/FallbackFont/Fonts', {
++            ApiKey: apiClient.accessToken()
++        });
++        const workerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`;
++        const legacyWorkerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`;
++        const [
++            config,
++            resolvedWorkerUrl,
++            resolvedLegacyWorkerUrl,
++            bridge
++        ] = await Promise.all([
++            apiClient.getNamedConfiguration('encoding'),
++            this.options.resolveUrl(workerUrl),
++            this.options.resolveUrl(legacyWorkerUrl),
++            resolveSubtitleFontBridge(apiClient, item.Id, mediaSource.Id, track.Index)
++        ]);
++
++        if (!request.isCurrent()) {
++            throw new Error('Subtitle load was cancelled');
++        }
++
++        const resolvedFonts = [ ...bridge.fontUrls ];
++        if (config.EnableFallbackFont) {
++            const fontFiles = await apiClient.getJSON(fallbackFontList);
++            if (!request.isCurrent()) {
++                throw new Error('Subtitle load was cancelled');
++            }
++
++            for (const font of fontFiles || []) {
++                resolvedFonts.push(apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
++                    ApiKey: apiClient.accessToken()
++                }));
++            }
++        }
++
++        const combinedFonts = [ ...new Set([ ...embeddedFonts, ...resolvedFonts ]) ];
++        const useBridgeFonts = bridge.fullyResolved && !attemptState.useAssFallbackFonts;
++        try {
++            return await createAssRendererAdapter({
++                videoElement: this.videoElement,
++                subtitleUrl: this.options.getSubtitleUrl(track, item),
++                fonts: useBridgeFonts ? [ ...new Set(resolvedFonts) ] : combinedFonts,
++                fallbackFonts: useBridgeFonts ? combinedFonts : undefined,
++                onRuntimeFallbackRequested: () => {
++                    attemptState.useAssFallbackFonts = true;
++                },
++                workerUrl: resolvedWorkerUrl,
++                legacyWorkerUrl: resolvedLegacyWorkerUrl,
++                baseTimeOffsetSeconds: (playbackOptions.transcodingOffsetTicks || 0) / 10_000_000,
++                targetFps: videoStream?.ReferenceFrameRate || 24,
++                request
++            });
++        } catch (error) {
++            if (request.isCurrent()) {
++                this.options.onAssError(error);
++            }
++            throw error;
++        }
++    }
++}
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..39e1a83b5f54d441951ddc44b1423dbf771b0642
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts
+@@ -0,0 +1,272 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++
++import type { SubtitleLoadRequest } from '../types';
++import {
++    computeAssRenderSize,
++    createAssRendererAdapter
++} from './AssRendererAdapter';
++
++interface MockOctopusOptions extends Record<string, unknown> {
++    canvas?: HTMLCanvasElement;
++    video?: HTMLVideoElement;
++    renderAhead?: number;
++    fonts?: string[];
++    onReady(): void;
++    onError(error: unknown): void;
++}
++
++const octopusMock = vi.hoisted(() => ({
++    instances: [] as MockOctopus[]
++}));
++
++class MockOctopus {
++    readonly options: MockOctopusOptions;
++    readonly resizeCalls: unknown[][] = [];
++    readonly currentTimeCalls: number[] = [];
++    readonly pausedCalls: [boolean, number][] = [];
++    readonly rateCalls: number[] = [];
++    disposed = false;
++
++    constructor(options: MockOctopusOptions) {
++        this.options = options;
++        octopusMock.instances.push(this);
++    }
++
++    resize(...args: unknown[]) {
++        this.resizeCalls.push(args);
++    }
++
++    setCurrentTime(time: number) {
++        this.currentTimeCalls.push(time);
++    }
++
++    setIsPaused(paused: boolean, time: number) {
++        this.pausedCalls.push([ paused, time ]);
++    }
++
++    setRate(rate: number) {
++        this.rateCalls.push(rate);
++    }
++
++    dispose() {
++        this.disposed = true;
++    }
++}
++
++vi.mock('@jellyfin/libass-wasm', () => ({
++    default: MockOctopus
++}));
++
++function createRequest() {
++    let current = true;
++    let cancel: (() => void) | undefined;
++    const reportRuntimeError = vi.fn();
++    const request: SubtitleLoadRequest = {
++        isCurrent: () => current,
++        onCancel: callback => {
++            cancel = callback;
++            return () => {
++                if (cancel === callback) cancel = undefined;
++            };
++        },
++        reportRuntimeError
++    };
++
++    return {
++        request,
++        reportRuntimeError,
++        cancel: () => cancel?.(),
++        invalidate: () => {
++            current = false;
++        }
++    };
++}
++
++function createVideo() {
++    const parent = document.createElement('div');
++    const video = document.createElement('video');
++    parent.appendChild(video);
++    Object.defineProperties(video, {
++        videoWidth: { configurable: true, value: 1920 },
++        videoHeight: { configurable: true, value: 1080 },
++        offsetWidth: { configurable: true, value: 1280 },
++        offsetHeight: { configurable: true, value: 720 }
++    });
++    return { parent, video };
++}
++
++function createOptions(request: SubtitleLoadRequest, videoElement: HTMLVideoElement) {
++    return {
++        videoElement,
++        subtitleUrl: 'https://example.test/subtitle.ass',
++        fonts: [ 'https://example.test/bridge.ttf' ],
++        fallbackFonts: [
++            'https://example.test/bridge.ttf',
++            'https://example.test/embedded.ttf'
++        ],
++        workerUrl: '/worker.js',
++        legacyWorkerUrl: '/worker-legacy.js',
++        baseTimeOffsetSeconds: 2,
++        targetFps: 24,
++        request
++    };
++}
++
++beforeEach(() => {
++    octopusMock.instances = [];
++});
++
++afterEach(() => {
++    vi.useRealTimers();
++});
++
++describe('computeAssRenderSize', () => {
++    it('matches libass prescaling for high-DPI and 4K canvases', () => {
++        expect(computeAssRenderSize(1920, 1080, 1))
++            .toEqual({ width: 1920, height: 1080 });
++        expect(computeAssRenderSize(1920, 1080, 2))
++            .toEqual({ width: 3072, height: 1728 });
++    });
++});
++
++describe('AssRendererAdapter', () => {
++    it('uses manual canvas mode and follows the shared subtitle clock', async () => {
++        const { parent, video } = createVideo();
++        const request = createRequest();
++        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++        const host = parent.querySelector<HTMLElement>('.subtitle-pipeline-ass');
++        expect(host?.style.position).toBe('absolute');
++        expect(host?.style.inset).toBe('0px');
++        expect(host?.style.width).toBe('100%');
++        expect(host?.style.height).toBe('100%');
++        expect(host?.style.visibility).toBe('hidden');
++        octopusMock.instances[0].options.onReady();
++        const renderer = await rendererPromise;
++        const octopus = octopusMock.instances[0];
++
++        expect(octopus.options.canvas).toBeInstanceOf(HTMLCanvasElement);
++        expect(octopus.options.video).toBeUndefined();
++        expect(octopus.options.renderAhead).toBe(0);
++
++        renderer.activate({ currentTime: 3, paused: false, playbackRate: 1.5, reason: 'selection' });
++        expect(host?.style.visibility).toBe('visible');
++        expect(host?.style.position).toBe('absolute');
++        expect(octopus.currentTimeCalls.at(-1)).toBe(5);
++        expect(octopus.rateCalls.at(-1)).toBe(1.5);
++        expect(octopus.pausedCalls.at(-1)).toEqual([ false, 5 ]);
++
++        renderer.setOffset(1);
++        renderer.update({ currentTime: 10, paused: true, playbackRate: 1, reason: 'seeked' });
++        expect(octopus.currentTimeCalls.at(-1)).toBe(13);
++        expect(octopus.pausedCalls.at(-1)).toEqual([ true, 13 ]);
++
++        renderer.dispose();
++        expect(octopus.disposed).toBe(true);
++        expect(parent.querySelector('.subtitle-pipeline-ass')).toBeNull();
++    });
++
++    it('retries initialization with embedded fallback fonts', async () => {
++        vi.useFakeTimers();
++        const { video } = createVideo();
++        const request = createRequest();
++        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
++
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++        octopusMock.instances[0].options.onError(new Error('font failure'));
++        await vi.runAllTimersAsync();
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(2));
++        octopusMock.instances[1].options.onReady();
++        const renderer = await rendererPromise;
++
++        expect(octopusMock.instances).toHaveLength(2);
++        expect(octopusMock.instances[0].options.fonts)
++            .toEqual([ 'https://example.test/bridge.ttf' ]);
++        expect(octopusMock.instances[1].options.fonts).toEqual([
++            'https://example.test/bridge.ttf',
++            'https://example.test/embedded.ttf'
++        ]);
++        renderer.dispose();
++    });
++
++    it('reports worker failures that happen after activation', async () => {
++        const { video } = createVideo();
++        const request = createRequest();
++        const onRuntimeFallbackRequested = vi.fn();
++        const rendererPromise = createAssRendererAdapter({
++            ...createOptions(request.request, video),
++            onRuntimeFallbackRequested
++        });
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++        octopusMock.instances[0].options.onReady();
++        const renderer = await rendererPromise;
++        const error = new Error('worker stopped');
++
++        octopusMock.instances[0].options.onError(error);
++        expect(onRuntimeFallbackRequested).toHaveBeenCalledOnce();
++        expect(request.reportRuntimeError).toHaveBeenCalledWith(error);
++        renderer.dispose();
++    });
++
++    it('cancels an unfinished renderer without leaving a canvas behind', async () => {
++        const { parent, video } = createVideo();
++        const request = createRequest();
++        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
++
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++        request.cancel();
++
++        await expect(rendererPromise).rejects.toThrow('cancelled');
++        expect(octopusMock.instances[0].disposed).toBe(true);
++        expect(parent.querySelector('.subtitle-pipeline-ass')).toBeNull();
++    });
++    it('clears stale ASS pixels immediately and resynchronizes after seeking', async () => {
++        const { parent, video } = createVideo();
++        const request = createRequest();
++        let scheduledFrame: FrameRequestCallback | undefined;
++        const requestFrame = vi.spyOn(window, 'requestAnimationFrame')
++            .mockImplementation(callback => {
++                scheduledFrame = callback;
++                return 41;
++            });
++        const cancelFrame = vi.spyOn(window, 'cancelAnimationFrame')
++            .mockImplementation(() => undefined);
++
++        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++        octopusMock.instances[0].options.onReady();
++        const renderer = await rendererPromise;
++        renderer.activate({ currentTime: 40, paused: false, playbackRate: 1, reason: 'selection' });
++
++        const canvas = parent.querySelector<HTMLCanvasElement>('.libassjs-canvas');
++        expect(canvas).not.toBeNull();
++        let canvasWidth = canvas?.width || 0;
++        let clearCount = 0;
++        Object.defineProperty(canvas, 'width', {
++            configurable: true,
++            get: () => canvasWidth,
++            set: value => {
++                clearCount++;
++                canvasWidth = value;
++            }
++        });
++
++        const octopus = octopusMock.instances[0];
++        renderer.update({ currentTime: 0, paused: false, playbackRate: 1, reason: 'seeking' });
++
++        expect(clearCount).toBe(1);
++        expect(octopus.pausedCalls.at(-1)).toEqual([ true, 2 ]);
++        expect(octopus.currentTimeCalls.at(-1)).toBe(2);
++
++        renderer.update({ currentTime: 0, paused: false, playbackRate: 1, reason: 'seeked' });
++        expect(requestFrame).toHaveBeenCalledOnce();
++        scheduledFrame?.(performance.now());
++
++        expect(octopus.pausedCalls.at(-1)).toEqual([ false, 2 ]);
++        expect(octopus.currentTimeCalls.at(-1)).toBe(2);
++
++        renderer.dispose();
++        requestFrame.mockRestore();
++        cancelFrame.mockRestore();
++    });
++});
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..623aa766fdc575d103031d6a2f60aed32bfc04c1
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts
+@@ -0,0 +1,359 @@
++import type {
++    SubtitleClockSnapshot,
++    SubtitleLoadRequest,
++    SubtitleRenderer
++} from '../types';
++
++const PRESCALE_FACTOR = 0.8;
++const PRESCALE_HEIGHT_LIMIT = 1080;
++const MAX_RENDER_HEIGHT = 2160;
++
++export function computeAssRenderSize(width: number, height: number, pixelRatio: number) {
++    const sourceWidth = width * pixelRatio;
++    const sourceHeight = height * pixelRatio;
++    let renderHeight = sourceHeight;
++    const direction = PRESCALE_FACTOR < 1 ? -1 : 1;
++
++    if (direction * renderHeight * PRESCALE_FACTOR <= direction * PRESCALE_HEIGHT_LIMIT) {
++        renderHeight *= PRESCALE_FACTOR;
++    } else if (direction * renderHeight < direction * PRESCALE_HEIGHT_LIMIT) {
++        renderHeight = PRESCALE_HEIGHT_LIMIT;
++    }
++
++    if (MAX_RENDER_HEIGHT > 0 && renderHeight > MAX_RENDER_HEIGHT) {
++        renderHeight = MAX_RENDER_HEIGHT;
++    }
++
++    return {
++        width: sourceWidth * renderHeight / sourceHeight,
++        height: renderHeight
++    };
++}
++
++interface AssRendererOptions {
++    videoElement: HTMLVideoElement;
++    subtitleUrl: string;
++    fonts: string[];
++    fallbackFonts?: string[];
++    workerUrl: string;
++    legacyWorkerUrl: string;
++    baseTimeOffsetSeconds: number;
++    targetFps: number;
++    request: SubtitleLoadRequest;
++    onRuntimeFallbackRequested?(): void;
++}
++
++interface SubtitlesOctopusInstance {
++    resize(width?: number, height?: number, top?: number, left?: number): void;
++    setCurrentTime(time: number): void;
++    setIsPaused(paused: boolean, time: number): void;
++    setRate(rate: number): void;
++    dispose(): void;
++}
++
++type SubtitlesOctopusConstructor = new (
++    options: Record<string, unknown>
++) => SubtitlesOctopusInstance;
++
++export class AssRendererAdapter implements SubtitleRenderer {
++    readonly videoElement: HTMLVideoElement;
++    readonly host: HTMLDivElement;
++    readonly canvas: HTMLCanvasElement;
++    readonly renderer: SubtitlesOctopusInstance;
++    readonly baseTimeOffsetSeconds: number;
++    readonly targetFps: number;
++    readonly resizeObserver?: ResizeObserver;
++    offsetSeconds = 0;
++    lastRate?: number;
++    lastPaused?: boolean;
++    lastRenderedTime?: number;
++    resyncFrameHandle?: number;
++    active = false;
++    disposed = false;
++
++    constructor(
++        options: AssRendererOptions,
++        host: HTMLDivElement,
++        canvas: HTMLCanvasElement,
++        renderer: SubtitlesOctopusInstance
++    ) {
++        this.videoElement = options.videoElement;
++        this.host = host;
++        this.canvas = canvas;
++        this.renderer = renderer;
++        this.baseTimeOffsetSeconds = options.baseTimeOffsetSeconds;
++        this.targetFps = Math.max(1, options.targetFps || 24);
++
++        if (typeof ResizeObserver !== 'undefined') {
++            this.resizeObserver = new ResizeObserver(this.resize);
++            this.resizeObserver.observe(this.videoElement);
++        }
++        window.addEventListener('resize', this.resize);
++        document.addEventListener('fullscreenchange', this.resize);
++    }
++
++    activate(snapshot: SubtitleClockSnapshot) {
++        if (this.disposed) return;
++        this.active = true;
++        this.resize();
++        this.clearCanvas();
++        this.update(snapshot);
++        // The canvas starts hidden and is only exposed after its final size and
++        // clock state are applied. This avoids briefly painting libass' default
++        // canvas size while switching from a text renderer.
++        this.host.style.visibility = 'visible';
++    }
++
++    update(snapshot: SubtitleClockSnapshot) {
++        if (this.disposed || !this.active) return;
++
++        const effectiveTime = snapshot.currentTime
++            + this.baseTimeOffsetSeconds
++            + this.offsetSeconds;
++        const force = snapshot.reason !== 'frame';
++        const discontinuity = snapshot.reason === 'loadstart'
++            || snapshot.reason === 'emptied'
++            || snapshot.reason === 'seeking';
++        const rendererPaused = snapshot.paused || discontinuity;
++
++        if (discontinuity) {
++            this.cancelResync();
++            this.clearCanvas();
++            this.lastRenderedTime = undefined;
++        }
++
++        if (force || this.lastRate !== snapshot.playbackRate) {
++            this.lastRate = snapshot.playbackRate;
++            this.renderer.setRate(snapshot.playbackRate);
++        }
++        if (force || this.lastPaused !== rendererPaused) {
++            this.lastPaused = rendererPaused;
++            this.renderer.setIsPaused(rendererPaused, effectiveTime);
++        }
++
++        const minimumInterval = 1 / this.targetFps;
++        if (
++            force
++            || this.lastRenderedTime === undefined
++            || Math.abs(effectiveTime - this.lastRenderedTime) >= minimumInterval
++        ) {
++            this.lastRenderedTime = effectiveTime;
++            this.renderer.setCurrentTime(effectiveTime);
++        }
++
++        if (
++            snapshot.reason === 'loadedmetadata'
++            || snapshot.reason === 'playing'
++            || snapshot.reason === 'seeked'
++        ) {
++            this.scheduleResync(snapshot, effectiveTime);
++        }
++    }
++
++    setOffset(offsetSeconds: number) {
++        this.offsetSeconds = offsetSeconds;
++        this.lastRenderedTime = undefined;
++    }
++
++    dispose() {
++        if (this.disposed) return;
++        this.disposed = true;
++        this.active = false;
++        this.resizeObserver?.disconnect();
++        this.cancelResync();
++        window.removeEventListener('resize', this.resize);
++        document.removeEventListener('fullscreenchange', this.resize);
++
++        try {
++            this.renderer.dispose();
++        } finally {
++            this.host.remove();
++        }
++    }
++
++    clearCanvas() {
++        // Resetting the bitmap dimensions clears every previously painted ASS
++        // frame even when libass has not produced a replacement frame yet.
++        const { width, height } = this.canvas;
++        this.canvas.width = width;
++        this.canvas.height = height;
++    }
++
++    cancelResync() {
++        if (this.resyncFrameHandle === undefined) return;
++        cancelAnimationFrame(this.resyncFrameHandle);
++        this.resyncFrameHandle = undefined;
++    }
++
++    scheduleResync(snapshot: SubtitleClockSnapshot, effectiveTime: number) {
++        this.cancelResync();
++        this.resyncFrameHandle = requestAnimationFrame(() => {
++            this.resyncFrameHandle = undefined;
++            if (this.disposed || !this.active) return;
++
++            this.lastRate = snapshot.playbackRate;
++            this.lastPaused = snapshot.paused;
++            this.lastRenderedTime = effectiveTime;
++            this.renderer.setRate(snapshot.playbackRate);
++            this.renderer.setIsPaused(snapshot.paused, effectiveTime);
++            this.renderer.setCurrentTime(effectiveTime);
++        });
++    }
++
++    resize = () => {
++        if (this.disposed || !this.active) return;
++
++        const videoWidth = this.videoElement.videoWidth;
++        const videoHeight = this.videoElement.videoHeight;
++        const elementWidth = this.videoElement.offsetWidth;
++        const elementHeight = this.videoElement.offsetHeight;
++        if (!videoWidth || !videoHeight || !elementWidth || !elementHeight) return;
++
++        const videoRatio = videoWidth / videoHeight;
++        const elementRatio = elementWidth / elementHeight;
++        let displayWidth = elementWidth;
++        let displayHeight = elementHeight;
++        if (elementRatio > videoRatio) {
++            displayWidth = Math.floor(elementHeight * videoRatio);
++        } else {
++            displayHeight = Math.floor(elementWidth / videoRatio);
++        }
++
++        const x = (elementWidth - displayWidth) / 2;
++        const y = (elementHeight - displayHeight) / 2;
++        const hostOffset = this.host.getBoundingClientRect().top
++            - this.videoElement.getBoundingClientRect().top;
++        const pixelRatio = window.devicePixelRatio || 1;
++
++        this.canvas.style.display = 'block';
++        this.canvas.style.position = 'absolute';
++        this.canvas.style.width = `${displayWidth}px`;
++        this.canvas.style.height = `${displayHeight}px`;
++        this.canvas.style.top = `${y - hostOffset}px`;
++        this.canvas.style.left = `${x}px`;
++        this.canvas.style.pointerEvents = 'none';
++        const renderSize = computeAssRenderSize(displayWidth, displayHeight, pixelRatio);
++        this.renderer.resize(renderSize.width, renderSize.height);
++    };
++}
++
++export async function createAssRendererAdapter(options: AssRendererOptions) {
++    const { default: SubtitlesOctopus } = await import('@jellyfin/libass-wasm') as {
++        default: SubtitlesOctopusConstructor;
++    };
++
++    if (!options.request.isCurrent()) {
++        throw new Error('Subtitle load was cancelled');
++    }
++
++    const parentElement = options.videoElement.parentElement;
++    if (!parentElement) {
++        throw new Error('Unable to attach the ASS subtitle renderer');
++    }
++
++    const host = document.createElement('div');
++    host.classList.add('libassjs-canvas-parent', 'subtitle-pipeline-ass');
++    Object.assign(host.style, {
++        position: 'absolute',
++        inset: '0',
++        width: '100%',
++        height: '100%',
++        overflow: 'hidden',
++        pointerEvents: 'none',
++        visibility: 'hidden',
++        zIndex: '1'
++    });
++    const canvas = document.createElement('canvas');
++    canvas.classList.add('libassjs-canvas');
++    host.appendChild(canvas);
++    parentElement.appendChild(host);
++
++    return new Promise<SubtitleRenderer>((resolve, reject) => {
++        const primaryFonts = [ ...new Set(options.fonts) ];
++        const fallbackFonts = [ ...new Set(options.fallbackFonts || []) ];
++        const fontSets = [ primaryFonts ];
++        if (fallbackFonts.length > 0 && fallbackFonts.join('\n') !== primaryFonts.join('\n')) {
++            fontSets.push(fallbackFonts);
++        }
++
++        let renderer: SubtitlesOctopusInstance | undefined;
++        let fontSetIndex = 0;
++        let settled = false;
++        let unsubscribeCancel: () => void = () => undefined;
++
++        const disposePending = () => {
++            try {
++                renderer?.dispose();
++            } catch (error) {
++                console.debug('Unable to dispose pending ASS renderer', error);
++            }
++            renderer = undefined;
++        };
++        const rejectOnce = (error: unknown) => {
++            if (settled) return;
++            settled = true;
++            unsubscribeCancel();
++            disposePending();
++            host.remove();
++            reject(error);
++        };
++        const onReady = () => {
++            void Promise.resolve().then(() => {
++                if (settled || !renderer || !options.request.isCurrent()) return;
++
++                const adapter = new AssRendererAdapter(options, host, canvas, renderer);
++                settled = true;
++                unsubscribeCancel();
++                resolve(adapter);
++            });
++        };
++        const onError = (error: unknown) => {
++            if (!options.request.isCurrent()) return;
++            if (settled) {
++                options.onRuntimeFallbackRequested?.();
++                options.request.reportRuntimeError(error);
++                return;
++            }
++
++            disposePending();
++            fontSetIndex++;
++            if (fontSetIndex < fontSets.length) {
++                setTimeout(createRenderer, 0);
++            } else {
++                rejectOnce(error instanceof Error ? error : new Error('Unable to initialize ASS subtitles'));
++            }
++        };
++        const createRenderer = () => {
++            if (settled || !options.request.isCurrent()) return;
++
++            try {
++                renderer = new SubtitlesOctopus({
++                    canvas,
++                    subUrl: options.subtitleUrl,
++                    fonts: fontSets[fontSetIndex] || [],
++                    workerUrl: options.workerUrl,
++                    legacyWorkerUrl: options.legacyWorkerUrl,
++                    onReady,
++                    onError,
++                    renderMode: 'wasm-blend',
++                    dropAllAnimations: false,
++                    libassMemoryLimit: 40,
++                    libassGlyphLimit: 40,
++                    targetFps: options.targetFps,
++                    prescaleFactor: PRESCALE_FACTOR,
++                    prescaleHeightLimit: PRESCALE_HEIGHT_LIMIT,
++                    maxRenderHeight: MAX_RENDER_HEIGHT,
++                    resizeVariation: 0.2,
++                    renderAhead: 0
++                });
++            } catch (error) {
++                rejectOnce(error);
++            }
++        };
++
++        unsubscribeCancel = options.request.onCancel(() => {
++            rejectOnce(new Error('Subtitle load was cancelled'));
++        });
++        createRenderer();
++    });
++}
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer.test.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..66484c6d1ce7258ba41c92d913e35cd41ef2ffa5
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer.test.ts
+@@ -0,0 +1,128 @@
++import { describe, expect, it, vi } from 'vitest';
++
++import {
++    TextEventRenderer,
++    TrackEventIndex,
++    findActiveTrackEvents,
++    normalizeTrackEventText
++} from './TextEventRenderer';
++
++const snapshot = (currentTime: number) => ({
++    currentTime,
++    paused: false,
++    playbackRate: 1,
++    reason: 'frame' as const
++});
++
++describe('TextEventRenderer', () => {
++    it('normalizes line breaks, strips ASS overrides, and tolerates empty text', () => {
++        expect(normalizeTrackEventText('{\\i1}One\\NTwo\r', false))
++            .toBe('\u200EOne\n\u200ETwo');
++        expect(normalizeTrackEventText(undefined, true)).toBe('\u200E');
++    });
++
++    it('returns every overlapping event at the requested time', () => {
++        const events = [
++            { StartPositionTicks: 0, EndPositionTicks: 20, Text: 'one' },
++            { StartPositionTicks: 10, EndPositionTicks: 30, Text: 'two' },
++            { StartPositionTicks: 31, EndPositionTicks: 40, Text: 'three' }
++        ];
++
++        expect(findActiveTrackEvents(events, 15).map(event => event.Text))
++            .toEqual([ 'one', 'two' ]);
++    });
++
++    it('uses an index for large tracks and remains correct after a backward seek', () => {
++        let endReads = 0;
++        const events = Array.from({ length: 20_000 }, (_, index) => ({
++            StartPositionTicks: index * 100,
++            get EndPositionTicks() {
++                endReads++;
++                return index * 100 + 50;
++            },
++            Text: String(index)
++        }));
++        const index = new TrackEventIndex(events);
++
++        endReads = 0;
++        expect(index.find(1_999_925).map(event => event.Text)).toEqual([ '19999' ]);
++        expect(endReads).toBeLessThan(10);
++
++        endReads = 0;
++        expect(index.find(1_025).map(event => event.Text)).toEqual([ '10' ]);
++        expect(endReads).toBeLessThan(10);
++    });
++
++    it('preserves overlapping cue order when a long cue spans many short cues', () => {
++        const index = new TrackEventIndex([
++            { StartPositionTicks: 0, EndPositionTicks: 1_000, Text: 'long' },
++            { StartPositionTicks: 100, EndPositionTicks: 150, Text: 'short-1' },
++            { StartPositionTicks: 200, EndPositionTicks: 250, Text: 'short-2' }
++        ]);
++
++        expect(index.find(125).map(event => event.Text)).toEqual([ 'long', 'short-1' ]);
++        expect(index.find(225).map(event => event.Text)).toEqual([ 'long', 'short-2' ]);
++        expect(index.find(50).map(event => event.Text)).toEqual([ 'long' ]);
++    });
++
++    it('updates immediately on seek and removes only its own slot on dispose', () => {
++        const parent = document.createElement('div');
++        const applyAppearance = vi.fn();
++        const first = new TextEventRenderer({
++            parentElement: parent,
++            slot: 0,
++            trackEvents: [
++                { StartPositionTicks: 10_000_000, EndPositionTicks: 20_000_000, Text: 'First' },
++                { StartPositionTicks: 50_000_000, EndPositionTicks: 60_000_000, Text: 'Later' }
++            ],
++            baseTimeOffsetSeconds: 0,
++            applyAppearance
++        });
++        const second = new TextEventRenderer({
++            parentElement: parent,
++            slot: 1,
++            trackEvents: [
++                { StartPositionTicks: 10_000_000, EndPositionTicks: 20_000_000, Text: 'Secondary' }
++            ],
++            baseTimeOffsetSeconds: 0,
++            secondaryBeforePrimary: true,
++            applyAppearance
++        });
++
++        first.activate(snapshot(1.5));
++        second.activate(snapshot(1.5));
++        expect(parent.textContent).toContain('First');
++        expect(parent.textContent).toContain('Secondary');
++
++        first.update({ ...snapshot(5.5), reason: 'seeked' });
++        expect(first.textElement?.textContent).toContain('Later');
++
++        first.dispose();
++        expect(parent.querySelector('[data-subtitle-slot="0"]')).toBeNull();
++        expect(parent.querySelector('[data-subtitle-slot="1"]')).not.toBeNull();
++
++        second.dispose();
++        expect(parent.querySelector('.videoSubtitles')).toBeNull();
++    });
++
++    it('applies subtitle offset without mutating track event timestamps', () => {
++        const parent = document.createElement('div');
++        const event = { StartPositionTicks: 20_000_000, EndPositionTicks: 30_000_000, Text: 'Offset' };
++        const renderer = new TextEventRenderer({
++            parentElement: parent,
++            slot: 0,
++            trackEvents: [ event ],
++            baseTimeOffsetSeconds: 0,
++            applyAppearance: () => undefined
++        });
++
++        renderer.activate(snapshot(1));
++        expect(renderer.textElement?.classList.contains('hide')).toBe(true);
++        renderer.setOffset(1);
++        renderer.update({ ...snapshot(1), reason: 'manual' });
++
++        expect(renderer.textElement?.textContent).toContain('Offset');
++        expect(event.StartPositionTicks).toBe(20_000_000);
++        renderer.dispose();
++    });
++});
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6ed6789c0e2620388bd7fdade2584a179099e6a
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer.ts
+@@ -0,0 +1,193 @@
++import DOMPurify from 'dompurify';
++
++import {
++    SECONDARY_SUBTITLE_SLOT,
++    type SubtitleClockSnapshot,
++    type SubtitleRenderer,
++    type SubtitleSlot,
++    type SubtitleTrackEvent
++} from '../types';
++
++interface TextEventRendererOptions {
++    parentElement: HTMLElement;
++    slot: SubtitleSlot;
++    trackEvents: SubtitleTrackEvent[];
++    baseTimeOffsetSeconds: number;
++    secondaryBeforePrimary?: boolean;
++    applyAppearance(container: HTMLElement, textElement: HTMLElement): void;
++}
++
++export function normalizeTrackEventText(text: string | null | undefined, useHtml: boolean) {
++    const result = (text || '')
++        .replace(/\\N/gi, '\n')
++        .replace(/\r/gi, '')
++        .replace(/{\\.*?}/gi, '')
++        .split('\n')
++        .map(value => `\u200E${value}`)
++        .join('\n');
++
++    return useHtml ? result.replace(/\n/gi, '<br>') : result;
++}
++
++export class TrackEventIndex {
++    readonly events: SubtitleTrackEvent[];
++    readonly prefixMaximumEndTicks: number[];
++    lastTicks?: number;
++    upperBound = 0;
++
++    constructor(trackEvents: SubtitleTrackEvent[]) {
++        this.events = [ ...trackEvents ].sort((left, right) => (
++            left.StartPositionTicks - right.StartPositionTicks
++        ));
++        this.prefixMaximumEndTicks = new Array<number>(this.events.length);
++        let maximumEndTicks = Number.NEGATIVE_INFINITY;
++        for (let index = 0; index < this.events.length; index++) {
++            maximumEndTicks = Math.max(maximumEndTicks, this.events[index].EndPositionTicks);
++            this.prefixMaximumEndTicks[index] = maximumEndTicks;
++        }
++    }
++
++    find(ticks: number) {
++        if (this.lastTicks === undefined || ticks < this.lastTicks) {
++            this.upperBound = this.findUpperBound(ticks);
++        } else {
++            while (
++                this.upperBound < this.events.length
++                && this.events[this.upperBound].StartPositionTicks <= ticks
++            ) {
++                this.upperBound++;
++            }
++        }
++        this.lastTicks = ticks;
++
++        const activeEvents: SubtitleTrackEvent[] = [];
++        for (let index = this.upperBound - 1; index >= 0; index--) {
++            if (this.prefixMaximumEndTicks[index] < ticks) break;
++
++            const event = this.events[index];
++            if (event.EndPositionTicks >= ticks && event.Text) {
++                activeEvents.push(event);
++            }
++        }
++        activeEvents.reverse();
++        return activeEvents;
++    }
++
++    reset() {
++        this.lastTicks = undefined;
++        this.upperBound = 0;
++    }
++
++    findUpperBound(ticks: number) {
++        let low = 0;
++        let high = this.events.length;
++        while (low < high) {
++            const middle = Math.floor((low + high) / 2);
++            if (this.events[middle].StartPositionTicks <= ticks) {
++                low = middle + 1;
++            } else {
++                high = middle;
++            }
++        }
++        return low;
++    }
++}
++
++export function findActiveTrackEvents(trackEvents: SubtitleTrackEvent[], ticks: number) {
++    return new TrackEventIndex(trackEvents).find(ticks);
++}
++
++export class TextEventRenderer implements SubtitleRenderer {
++    readonly parentElement: HTMLElement;
++    readonly slot: SubtitleSlot;
++    readonly trackEvents: SubtitleTrackEvent[];
++    readonly eventIndex: TrackEventIndex;
++    readonly baseTimeOffsetSeconds: number;
++    readonly secondaryBeforePrimary: boolean;
++    readonly applyAppearance: (container: HTMLElement, textElement: HTMLElement) => void;
++    offsetSeconds = 0;
++    container?: HTMLElement;
++    textElement?: HTMLElement;
++    lastHtml?: string;
++    disposed = false;
++
++    constructor(options: TextEventRendererOptions) {
++        this.parentElement = options.parentElement;
++        this.slot = options.slot;
++        this.eventIndex = new TrackEventIndex(options.trackEvents);
++        this.trackEvents = this.eventIndex.events;
++        this.baseTimeOffsetSeconds = options.baseTimeOffsetSeconds;
++        this.secondaryBeforePrimary = Boolean(options.secondaryBeforePrimary);
++        this.applyAppearance = options.applyAppearance;
++    }
++
++    activate(snapshot: SubtitleClockSnapshot) {
++        if (this.disposed || this.textElement) return;
++
++        let container = this.parentElement.querySelector<HTMLElement>('.videoSubtitles');
++        if (!container) {
++            container = document.createElement('div');
++            container.classList.add('videoSubtitles');
++            this.parentElement.appendChild(container);
++        }
++
++        const textElement = document.createElement('div');
++        textElement.dataset.subtitleSlot = String(this.slot);
++        if (this.slot === SECONDARY_SUBTITLE_SLOT) {
++            textElement.classList.add('videoSecondarySubtitlesInner');
++            textElement.style.order = this.secondaryBeforePrimary ? '0' : '1';
++        } else {
++            textElement.classList.add('videoSubtitlesInner');
++            textElement.style.order = this.secondaryBeforePrimary ? '1' : '0';
++        }
++
++        container.appendChild(textElement);
++        this.container = container;
++        this.textElement = textElement;
++        this.applyAppearance(container, textElement);
++        this.update(snapshot);
++    }
++
++    update(snapshot: SubtitleClockSnapshot) {
++        if (this.disposed || !this.textElement) return;
++
++        const ticks = (
++            snapshot.currentTime
++            + this.baseTimeOffsetSeconds
++            + this.offsetSeconds
++        ) * 10_000_000;
++        const html = this.eventIndex.find(ticks)
++            .map(event => normalizeTrackEventText(event.Text || '', true))
++            .join('<br>');
++
++        if (html === this.lastHtml) return;
++        this.lastHtml = html;
++
++        if (html) {
++            this.textElement.innerHTML = DOMPurify.sanitize(html);
++            this.textElement.classList.remove('hide');
++        } else {
++            this.textElement.innerHTML = '';
++            this.textElement.classList.add('hide');
++        }
++    }
++
++    setOffset(offsetSeconds: number) {
++        this.offsetSeconds = offsetSeconds;
++        this.lastHtml = undefined;
++        this.eventIndex.reset();
++    }
++
++    dispose() {
++        if (this.disposed) return;
++        this.disposed = true;
++        this.textElement?.remove();
++
++        if (this.container && this.container.childElementCount === 0) {
++            this.container.remove();
++        }
++
++        this.textElement = undefined;
++        this.container = undefined;
++    }
++}
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.test.ts b/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcdc87ff30f968c383f1f189f49d38e1e6e3cde9
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.test.ts
+@@ -0,0 +1,145 @@
++import { describe, expect, it, vi } from 'vitest';
++
++import { SubtitleClock } from './SubtitleClock';
++
++function createVideoFrameHarness() {
++    const video = document.createElement('video');
++    const callbacks = new Map<number, VideoFrameRequestCallback>();
++    let nextHandle = 0;
++    const requestVideoFrameCallback = vi.fn((callback: VideoFrameRequestCallback) => {
++        const handle = ++nextHandle;
++        callbacks.set(handle, callback);
++        return handle;
++    });
++    const cancelVideoFrameCallback = vi.fn((handle: number) => {
++        callbacks.delete(handle);
++    });
++
++    Object.defineProperties(video, {
++        paused: { configurable: true, value: false },
++        ended: { configurable: true, value: false },
++        requestVideoFrameCallback: {
++            configurable: true,
++            value: requestVideoFrameCallback
++        },
++        cancelVideoFrameCallback: {
++            configurable: true,
++            value: cancelVideoFrameCallback
++        }
++    });
++
++    return {
++        video,
++        callbacks,
++        requestVideoFrameCallback,
++        cancelVideoFrameCallback
++    };
++}
++
++describe('SubtitleClock', () => {
++    it('cancels and rearms video-frame callbacks across repeated media sources', () => {
++        const harness = createVideoFrameHarness();
++        const clock = new SubtitleClock(harness.video);
++
++        expect(harness.requestVideoFrameCallback).toHaveBeenCalledTimes(1);
++        for (let source = 0; source < 20; source++) {
++            harness.video.dispatchEvent(new Event('loadstart'));
++            harness.video.dispatchEvent(new Event('loadedmetadata'));
++            harness.video.dispatchEvent(new Event('playing'));
++            expect(harness.callbacks.size).toBe(1);
++        }
++
++        expect(harness.cancelVideoFrameCallback).toHaveBeenCalledTimes(60);
++        expect(harness.requestVideoFrameCallback).toHaveBeenCalledTimes(61);
++
++        clock.dispose();
++        expect(harness.callbacks.size).toBe(0);
++        expect(harness.cancelVideoFrameCallback).toHaveBeenCalledTimes(61);
++    });
++
++    it('keeps the clock paused after seeking until playback actually resumes', () => {
++        const harness = createVideoFrameHarness();
++        const clock = new SubtitleClock(harness.video);
++        const listener = vi.fn();
++        clock.subscribe(listener);
++
++        Object.defineProperty(harness.video, 'currentTime', {
++            configurable: true,
++            value: 0
++        });
++        harness.video.dispatchEvent(new Event('seeking'));
++        harness.video.dispatchEvent(new Event('seeked'));
++
++        expect(listener).toHaveBeenNthCalledWith(1, expect.objectContaining({
++            currentTime: 0,
++            paused: true,
++            reason: 'seeking'
++        }));
++        expect(listener).toHaveBeenNthCalledWith(2, expect.objectContaining({
++            currentTime: 0,
++            paused: true,
++            reason: 'seeked'
++        }));
++
++        harness.video.dispatchEvent(new Event('playing'));
++        expect(listener).toHaveBeenNthCalledWith(3, expect.objectContaining({
++            currentTime: 0,
++            paused: false,
++            reason: 'playing'
++        }));
++
++        clock.dispose();
++    });
++
++    it('does not resume subtitle time from canplay while media is still buffering', () => {
++        const harness = createVideoFrameHarness();
++        const clock = new SubtitleClock(harness.video);
++        const listener = vi.fn();
++        clock.subscribe(listener);
++
++        harness.video.dispatchEvent(new Event('waiting'));
++        harness.video.dispatchEvent(new Event('canplay'));
++        harness.video.dispatchEvent(new Event('playing'));
++
++        expect(listener).toHaveBeenNthCalledWith(1, expect.objectContaining({
++            paused: true,
++            reason: 'waiting'
++        }));
++        expect(listener).toHaveBeenNthCalledWith(2, expect.objectContaining({
++            paused: true,
++            reason: 'canplay'
++        }));
++        expect(listener).toHaveBeenNthCalledWith(3, expect.objectContaining({
++            paused: false,
++            reason: 'playing'
++        }));
++
++        clock.dispose();
++    });
++
++    it('pauses for encrypted-media waits and low-buffer stalls', () => {
++        const harness = createVideoFrameHarness();
++        const clock = new SubtitleClock(harness.video);
++        const listener = vi.fn();
++        clock.subscribe(listener);
++
++        Object.defineProperty(harness.video, 'readyState', {
++            configurable: true,
++            value: HTMLMediaElement.HAVE_CURRENT_DATA
++        });
++        harness.video.dispatchEvent(new Event('stalled'));
++        harness.video.dispatchEvent(new Event('playing'));
++        harness.video.dispatchEvent(new Event('waitingforkey'));
++
++        expect(listener).toHaveBeenNthCalledWith(1, expect.objectContaining({
++            paused: true,
++            reason: 'stalled'
++        }));
++        expect(listener).toHaveBeenNthCalledWith(3, expect.objectContaining({
++            paused: true,
++            reason: 'waitingforkey'
++        }));
++
++        clock.dispose();
++    });
++});
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.ts b/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..fbfc182de258a358bc6430803cf64182c46079c2
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.ts
+@@ -0,0 +1,161 @@
++import type {
++    SubtitleClockReason,
++    SubtitleClockSnapshot
++} from './types';
++
++type SubtitleClockListener = (snapshot: SubtitleClockSnapshot) => void;
++
++const VIDEO_EVENTS = [
++    'loadstart',
++    'emptied',
++    'loadedmetadata',
++    'loadeddata',
++    'canplay',
++    'playing',
++    'pause',
++    'waiting',
++    'stalled',
++    'waitingforkey',
++    'seeking',
++    'seeked',
++    'ratechange'
++] as const;
++
++const FRAME_LOOP_RESET_EVENTS = new Set<SubtitleClockReason>([
++    'loadstart',
++    'emptied',
++    'loadedmetadata',
++    'playing',
++    'waiting',
++    'stalled',
++    'waitingforkey',
++    'seeking',
++    'seeked'
++]);
++
++export class SubtitleClock {
++    readonly videoElement: HTMLVideoElement;
++    readonly listeners = new Set<SubtitleClockListener>();
++    disposed = false;
++    buffering = false;
++    videoFrameHandle?: number;
++    animationFrameHandle?: number;
++
++    constructor(videoElement: HTMLVideoElement) {
++        this.videoElement = videoElement;
++
++        for (const eventName of VIDEO_EVENTS) {
++            videoElement.addEventListener(eventName, this.onVideoEvent);
++        }
++
++        videoElement.addEventListener('timeupdate', this.onTimeUpdate);
++        this.scheduleFrame();
++    }
++
++    subscribe(listener: SubtitleClockListener) {
++        this.listeners.add(listener);
++        return () => this.listeners.delete(listener);
++    }
++
++    snapshot(reason: SubtitleClockReason = 'manual'): SubtitleClockSnapshot {
++        return {
++            currentTime: Number.isFinite(this.videoElement.currentTime) ? this.videoElement.currentTime : 0,
++            paused: this.videoElement.paused || this.videoElement.seeking || this.buffering,
++            playbackRate: this.videoElement.playbackRate || 1,
++            reason
++        };
++    }
++
++    pulse(reason: SubtitleClockReason = 'manual') {
++        if (this.disposed) return;
++
++        const snapshot = this.snapshot(reason);
++        for (const listener of this.listeners) {
++            listener(snapshot);
++        }
++    }
++
++    dispose() {
++        if (this.disposed) return;
++        this.disposed = true;
++
++        for (const eventName of VIDEO_EVENTS) {
++            this.videoElement.removeEventListener(eventName, this.onVideoEvent);
++        }
++        this.videoElement.removeEventListener('timeupdate', this.onTimeUpdate);
++        this.cancelScheduledFrame();
++        this.listeners.clear();
++    }
++
++    onVideoEvent = (event: Event) => {
++        const reason = event.type as SubtitleClockReason;
++        if (
++            reason === 'loadstart'
++            || reason === 'emptied'
++            || reason === 'waiting'
++            || reason === 'waitingforkey'
++            || reason === 'seeking'
++            || (reason === 'stalled' && this.videoElement.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)
++        ) {
++            this.buffering = true;
++        } else if (reason === 'playing') {
++            this.buffering = false;
++        }
++
++        if (FRAME_LOOP_RESET_EVENTS.has(reason)) {
++            this.cancelScheduledFrame();
++        }
++
++        this.pulse(reason);
++        this.scheduleFrame();
++    };
++
++    onTimeUpdate = () => {
++        // timeupdate is a fallback heartbeat for browsers and WebViews that
++        // do not reliably deliver video-frame callbacks.
++        this.pulse('frame');
++        this.scheduleFrame();
++    };
++
++    onVideoFrame: VideoFrameRequestCallback = () => {
++        this.videoFrameHandle = undefined;
++        this.pulse('frame');
++        this.scheduleFrame();
++    };
++
++    onAnimationFrame = () => {
++        this.animationFrameHandle = undefined;
++        if (!this.videoElement.paused && !this.videoElement.ended && !this.buffering) {
++            this.pulse('frame');
++        }
++        this.scheduleFrame();
++    };
++
++    cancelScheduledFrame() {
++        if (this.videoFrameHandle !== undefined) {
++            this.videoElement.cancelVideoFrameCallback?.(this.videoFrameHandle);
++            this.videoFrameHandle = undefined;
++        }
++        if (this.animationFrameHandle !== undefined) {
++            cancelAnimationFrame(this.animationFrameHandle);
++            this.animationFrameHandle = undefined;
++        }
++    }
++
++    scheduleFrame() {
++        if (this.disposed) return;
++
++        if (this.videoElement.requestVideoFrameCallback) {
++            if (this.videoFrameHandle === undefined) {
++                this.videoFrameHandle = this.videoElement.requestVideoFrameCallback(this.onVideoFrame);
++            }
++            return;
++        }
++
++        if (this.videoElement.paused || this.videoElement.ended || this.buffering) return;
++
++        if (this.animationFrameHandle === undefined) {
++            this.animationFrameHandle = requestAnimationFrame(this.onAnimationFrame);
++        }
++    }
++}
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.test.ts b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcac83be5f8e4e3c6f96880a73e11ddb22017533
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.test.ts
+@@ -0,0 +1,343 @@
++import { describe, expect, it, vi } from 'vitest';
++
++import { TextSubtitlePipeline } from './TextSubtitlePipeline';
++import type { SubtitleLoadRequest, SubtitleRenderer } from './types';
++
++function deferred<T>() {
++    let resolve!: (value: T) => void;
++    let reject!: (error: unknown) => void;
++    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
++        resolve = resolvePromise;
++        reject = rejectPromise;
++    });
++    return { promise, resolve, reject };
++}
++
++function createRenderer() {
++    return {
++        activate: vi.fn(),
++        update: vi.fn(),
++        setOffset: vi.fn(),
++        dispose: vi.fn()
++    } satisfies SubtitleRenderer;
++}
++
++function createPipeline() {
++    return new TextSubtitlePipeline(document.createElement('video'));
++}
++
++describe('TextSubtitlePipeline', () => {
++    it('keeps the active subtitle visible until its replacement is ready', async () => {
++        const pipeline = createPipeline();
++        const first = createRenderer();
++        const second = createRenderer();
++        const pending = deferred<SubtitleRenderer>();
++
++        await pipeline.select(0, 1, async () => first);
++        const replacement = pipeline.select(0, 2, () => pending.promise);
++
++        expect(first.dispose).not.toHaveBeenCalled();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(1);
++
++        pending.resolve(second);
++        await replacement;
++
++        expect(second.activate).toHaveBeenCalledOnce();
++        expect(first.dispose).toHaveBeenCalledOnce();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(2);
++        pipeline.dispose();
++    });
++
++    it('disposes a stale renderer that finishes after a newer selection', async () => {
++        const pipeline = createPipeline();
++        const stale = createRenderer();
++        const current = createRenderer();
++        const staleLoad = deferred<SubtitleRenderer>();
++        const currentLoad = deferred<SubtitleRenderer>();
++
++        const staleFactory = vi.fn(() => staleLoad.promise);
++        const staleSelection = pipeline.select(0, 1, staleFactory);
++        await vi.waitFor(() => expect(staleFactory).toHaveBeenCalledOnce());
++        const currentSelection = pipeline.select(0, 2, () => currentLoad.promise);
++        staleLoad.resolve(stale);
++        await staleSelection;
++
++        expect(stale.activate).not.toHaveBeenCalled();
++        expect(stale.dispose).toHaveBeenCalledOnce();
++
++        currentLoad.resolve(current);
++        await currentSelection;
++        expect(current.activate).toHaveBeenCalledOnce();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(2);
++        pipeline.dispose();
++    });
++    it('does not start a renderer factory superseded in the same turn', async () => {
++        const pipeline = createPipeline();
++        const cancelledFactory = vi.fn(async () => createRenderer());
++        const current = createRenderer();
++
++        const cancelledSelection = pipeline.select(0, 1, cancelledFactory);
++        const currentSelection = pipeline.select(0, 2, async () => current);
++        await Promise.all([ cancelledSelection, currentSelection ]);
++
++        expect(cancelledFactory).not.toHaveBeenCalled();
++        expect(current.activate).toHaveBeenCalledOnce();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(2);
++        pipeline.dispose();
++    });
++
++    it('cancels a pending replacement when switching back to the active track', async () => {
++        const pipeline = createPipeline();
++        const active = createRenderer();
++        const stale = createRenderer();
++        const staleLoad = deferred<SubtitleRenderer>();
++        const activeFactory = vi.fn(async () => createRenderer());
++
++        await pipeline.select(0, 1, async () => active);
++        const staleFactory = vi.fn(() => staleLoad.promise);
++        const staleSelection = pipeline.select(0, 2, staleFactory);
++        await vi.waitFor(() => expect(staleFactory).toHaveBeenCalledOnce());
++        await pipeline.select(0, 1, activeFactory);
++
++        expect(activeFactory).not.toHaveBeenCalled();
++        expect(active.dispose).not.toHaveBeenCalled();
++        expect(pipeline.getTrackIndex(0)).toBe(1);
++
++        staleLoad.resolve(stale);
++        await staleSelection;
++        expect(stale.dispose).toHaveBeenCalledOnce();
++        pipeline.dispose();
++    });
++
++    it('keeps the previous renderer after a failed replacement and allows retry', async () => {
++        const onStateChange = vi.fn();
++        const pipeline = new TextSubtitlePipeline(document.createElement('video'), { onStateChange });
++        const first = createRenderer();
++        const retry = createRenderer();
++
++        await pipeline.select(0, 1, async () => first);
++        await pipeline.select(0, 2, async () => {
++            throw new Error('network failure');
++        });
++
++        expect(first.dispose).not.toHaveBeenCalled();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(1);
++        expect(pipeline.getTrackIndex(0)).toBe(1);
++        expect(onStateChange).toHaveBeenLastCalledWith(expect.objectContaining({
++            trackIndex: 2,
++            state: 'failed',
++            restoredTrackIndex: 1
++        }));
++
++        await pipeline.select(0, 2, async () => retry);
++        expect(retry.activate).toHaveBeenCalledOnce();
++        expect(first.dispose).toHaveBeenCalledOnce();
++        pipeline.dispose();
++    });
++
++    it('applies an offset set while a renderer is loading', async () => {
++        const pipeline = createPipeline();
++        const renderer = createRenderer();
++        const pending = deferred<SubtitleRenderer>();
++        const selection = pipeline.select(0, 4, () => pending.promise);
++
++        pipeline.setOffset(0, 1.25);
++        pending.resolve(renderer);
++        await selection;
++
++        expect(renderer.setOffset).toHaveBeenCalledWith(1.25);
++        pipeline.dispose();
++    });
++
++    it('updates active renderers immediately after a seek event', async () => {
++        const video = document.createElement('video');
++        const pipeline = new TextSubtitlePipeline(video);
++        const renderer = createRenderer();
++
++        await pipeline.select(0, 3, async () => renderer);
++        renderer.update.mockClear();
++        Object.defineProperty(video, 'currentTime', {
++            configurable: true,
++            value: 42
++        });
++        video.dispatchEvent(new Event('seeked'));
++
++        expect(renderer.update).toHaveBeenCalledWith(expect.objectContaining({
++            currentTime: 42,
++            reason: 'seeked'
++        }));
++        pipeline.dispose();
++    });
++    it('pauses renderer time while the video is buffering', async () => {
++        const video = document.createElement('video');
++        const pipeline = new TextSubtitlePipeline(video);
++        const renderer = createRenderer();
++
++        await pipeline.select(0, 5, async () => renderer);
++        renderer.update.mockClear();
++        video.dispatchEvent(new Event('waiting'));
++
++        expect(renderer.update).toHaveBeenCalledWith(expect.objectContaining({
++            paused: true,
++            reason: 'waiting'
++        }));
++        pipeline.dispose();
++    });
++
++    it('keeps primary and secondary subtitle slots independent', async () => {
++        const pipeline = createPipeline();
++        const primary = createRenderer();
++        const secondary = createRenderer();
++
++        await pipeline.select(0, 1, async () => primary);
++        await pipeline.select(1, 2, async () => secondary);
++        pipeline.clear(0);
++
++        expect(primary.dispose).toHaveBeenCalledOnce();
++        expect(secondary.dispose).not.toHaveBeenCalled();
++        expect(pipeline.getActiveTrackIndex(1)).toBe(2);
++
++        pipeline.dispose();
++        expect(secondary.dispose).toHaveBeenCalledOnce();
++    });
++    it('rejects a renderer that reports failure while it is being activated', async () => {
++        const pipeline = createPipeline();
++        const renderer = createRenderer();
++
++        await pipeline.select(0, 6, async request => {
++            request.reportRuntimeError(new Error('failed before activation'));
++            return renderer;
++        });
++
++        expect(renderer.dispose).toHaveBeenCalledOnce();
++        expect(renderer.activate).not.toHaveBeenCalled();
++        expect(pipeline.getActiveTrackIndex(0)).toBeUndefined();
++        pipeline.dispose();
++    });
++
++    it('recreates an active renderer only once after a runtime failure', async () => {
++        const pipeline = createPipeline();
++        const first = createRenderer();
++        const retry = createRenderer();
++        let request!: SubtitleLoadRequest;
++        const factory = vi.fn(async (nextRequest: SubtitleLoadRequest) => {
++            request = nextRequest;
++            return factory.mock.calls.length === 1 ? first : retry;
++        });
++
++        await pipeline.select(0, 7, factory);
++        request.reportRuntimeError(new Error('worker stopped'));
++        await vi.waitFor(() => expect(retry.activate).toHaveBeenCalledOnce());
++
++        expect(factory).toHaveBeenCalledTimes(2);
++        expect(first.dispose).toHaveBeenCalledOnce();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(7);
++        pipeline.dispose();
++    });
++
++    it('clears a track after the single runtime recovery attempt also fails', async () => {
++        const onStateChange = vi.fn();
++        const pipeline = new TextSubtitlePipeline(document.createElement('video'), { onStateChange });
++        const first = createRenderer();
++        const retry = createRenderer();
++        let request!: SubtitleLoadRequest;
++        const factory = vi.fn(async (nextRequest: SubtitleLoadRequest) => {
++            request = nextRequest;
++            return factory.mock.calls.length === 1 ? first : retry;
++        });
++
++        await pipeline.select(0, 8, factory);
++        request.reportRuntimeError(new Error('first worker stopped'));
++        await vi.waitFor(() => expect(retry.activate).toHaveBeenCalledOnce());
++        request.reportRuntimeError(new Error('replacement worker stopped'));
++
++        expect(factory).toHaveBeenCalledTimes(2);
++        expect(pipeline.getTrackIndex(0)).toBeUndefined();
++        expect(pipeline.getActiveTrackIndex(0)).toBeUndefined();
++        expect(onStateChange).toHaveBeenLastCalledWith(expect.objectContaining({
++            state: 'failed',
++            restoredTrackIndex: -1
++        }));
++        pipeline.dispose();
++    });
++
++    it('lets a pending replacement finish if the previous renderer fails', async () => {
++        const onStateChange = vi.fn();
++        const pipeline = new TextSubtitlePipeline(document.createElement('video'), { onStateChange });
++        const previous = createRenderer();
++        const replacement = createRenderer();
++        const replacementLoad = deferred<SubtitleRenderer>();
++        let previousRequest!: SubtitleLoadRequest;
++
++        await pipeline.select(0, 9, async request => {
++            previousRequest = request;
++            return previous;
++        });
++        const selection = pipeline.select(0, 10, () => replacementLoad.promise);
++        previousRequest.reportRuntimeError(new Error('old worker stopped'));
++
++        expect(previous.dispose).toHaveBeenCalledOnce();
++        expect(pipeline.getTrackIndex(0)).toBe(10);
++        replacementLoad.resolve(replacement);
++        await selection;
++
++        expect(replacement.activate).toHaveBeenCalledOnce();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(10);
++        expect(onStateChange).not.toHaveBeenCalledWith(expect.objectContaining({
++            trackIndex: 9,
++            state: 'failed'
++        }));
++        pipeline.dispose();
++    });
++
++    it('survives repeated track changes without retaining old renderers', async () => {
++        const pipeline = createPipeline();
++        const renderers: ReturnType<typeof createRenderer>[] = [];
++
++        for (let index = 0; index < 50; index++) {
++            const renderer = createRenderer();
++            renderers.push(renderer);
++            await pipeline.select(0, index, async () => renderer);
++        }
++
++        expect(pipeline.getActiveTrackIndex(0)).toBe(49);
++        for (const renderer of renderers.slice(0, -1)) {
++            expect(renderer.dispose).toHaveBeenCalledOnce();
++        }
++        expect(renderers.at(-1)?.dispose).not.toHaveBeenCalled();
++
++        pipeline.dispose();
++        expect(renderers.at(-1)?.dispose).toHaveBeenCalledOnce();
++    });
++    it('detaches an old playback generation before reusing the video element', async () => {
++        const video = document.createElement('video');
++        const oldPipeline = new TextSubtitlePipeline(video);
++        const oldRenderer = createRenderer();
++        await oldPipeline.select(0, 8, async () => oldRenderer);
++        oldPipeline.dispose();
++        oldRenderer.update.mockClear();
++
++        const currentPipeline = new TextSubtitlePipeline(video);
++        const currentRenderer = createRenderer();
++        await currentPipeline.select(0, 9, async () => currentRenderer);
++        currentRenderer.update.mockClear();
++
++        Object.defineProperty(video, 'currentTime', {
++            configurable: true,
++            value: 0
++        });
++        video.dispatchEvent(new Event('seeking'));
++        video.dispatchEvent(new Event('seeked'));
++
++        expect(oldRenderer.update).not.toHaveBeenCalled();
++        expect(currentRenderer.update).toHaveBeenCalledWith(expect.objectContaining({
++            currentTime: 0,
++            reason: 'seeking'
++        }));
++        expect(currentRenderer.update).toHaveBeenCalledWith(expect.objectContaining({
++            currentTime: 0,
++            reason: 'seeked'
++        }));
++        currentPipeline.dispose();
++    });
++});
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b1812f84283705f44bccc542bebcb6f77338357
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts
+@@ -0,0 +1,339 @@
++import { SubtitleClock } from './SubtitleClock';
++import type {
++    SubtitleClockSnapshot,
++    SubtitleLoadRequest,
++    SubtitlePipelineStateChange,
++    SubtitleRenderer,
++    SubtitleRendererFactory,
++    SubtitleSlot
++} from './types';
++
++interface ActiveRendererState {
++    generation: symbol;
++    trackIndex: number;
++    factory: SubtitleRendererFactory;
++    renderer: SubtitleRenderer;
++}
++
++interface LoadingRendererState {
++    generation: symbol;
++    trackIndex: number;
++    cancel(): void;
++    promise: Promise<void>;
++}
++
++interface SubtitleSlotState {
++    desiredTrackIndex?: number;
++    offsetSeconds: number;
++    runtimeRetries: number;
++    factory?: SubtitleRendererFactory;
++    active?: ActiveRendererState;
++    loading?: LoadingRendererState;
++}
++
++interface TextSubtitlePipelineOptions {
++    onStateChange?: (change: SubtitlePipelineStateChange) => void;
++}
++
++const MAX_RUNTIME_RETRIES = 1;
++
++export class TextSubtitlePipeline {
++    readonly videoElement: HTMLVideoElement;
++    readonly clock: SubtitleClock;
++    readonly slots = new Map<SubtitleSlot, SubtitleSlotState>();
++    readonly onStateChange?: (change: SubtitlePipelineStateChange) => void;
++    readonly unsubscribeClock: () => void;
++    disposed = false;
++
++    constructor(videoElement: HTMLVideoElement, options: TextSubtitlePipelineOptions = {}) {
++        this.videoElement = videoElement;
++        this.clock = new SubtitleClock(videoElement);
++        this.onStateChange = options.onStateChange;
++        this.unsubscribeClock = this.clock.subscribe(this.onClock);
++    }
++
++    getTrackIndex(slot: SubtitleSlot) {
++        return this.slots.get(slot)?.desiredTrackIndex;
++    }
++
++    getActiveTrackIndex(slot: SubtitleSlot) {
++        return this.slots.get(slot)?.active?.trackIndex;
++    }
++
++    async select(slot: SubtitleSlot, trackIndex: number, factory: SubtitleRendererFactory) {
++        if (this.disposed) return;
++
++        const state = this.getOrCreateSlot(slot);
++        const active = state.active;
++        const sameTrackIsActive = active?.trackIndex === trackIndex;
++        const sameTrackIsLoading = state.loading?.trackIndex === trackIndex;
++        if (state.desiredTrackIndex === trackIndex && sameTrackIsLoading) {
++            return state.loading?.promise;
++        }
++        if (sameTrackIsActive) {
++            state.desiredTrackIndex = trackIndex;
++            state.factory = factory;
++            active.factory = factory;
++            state.runtimeRetries = 0;
++            state.loading?.cancel();
++            state.loading = undefined;
++            try {
++                active.renderer.update(this.clock.snapshot('selection'));
++            } catch (error) {
++                this.handleRuntimeError(slot, active.generation, error);
++            }
++            return;
++        }
++
++        state.desiredTrackIndex = trackIndex;
++        state.factory = factory;
++        state.runtimeRetries = 0;
++        return this.prepare(slot, state, trackIndex, factory);
++    }
++
++    setOffset(slot: SubtitleSlot, offsetSeconds: number) {
++        const state = this.getOrCreateSlot(slot);
++        state.offsetSeconds = offsetSeconds;
++
++        if (!state.active) return;
++        try {
++            state.active.renderer.setOffset(offsetSeconds);
++            state.active.renderer.update(this.clock.snapshot('manual'));
++        } catch (error) {
++            this.handleRuntimeError(slot, state.active.generation, error);
++        }
++    }
++
++    sync() {
++        this.clock.pulse('manual');
++    }
++
++    clear(slot?: SubtitleSlot) {
++        const targetSlots = slot === undefined ? [ ...this.slots.keys() ] : [ slot ];
++        for (const targetSlot of targetSlots) {
++            const state = this.slots.get(targetSlot);
++            if (!state) continue;
++
++            state.desiredTrackIndex = undefined;
++            state.factory = undefined;
++            state.runtimeRetries = 0;
++            state.loading?.cancel();
++            state.loading = undefined;
++
++            const active = state.active;
++            state.active = undefined;
++            this.safeDispose(active?.renderer);
++            if (active) {
++                this.onStateChange?.({
++                    slot: targetSlot,
++                    trackIndex: active.trackIndex,
++                    state: 'disposed'
++                });
++            }
++
++            this.slots.delete(targetSlot);
++        }
++    }
++
++    dispose() {
++        if (this.disposed) return;
++        this.disposed = true;
++        this.clear();
++        this.unsubscribeClock();
++        this.clock.dispose();
++    }
++
++    getOrCreateSlot(slot: SubtitleSlot) {
++        let state = this.slots.get(slot);
++        if (!state) {
++            state = {
++                offsetSeconds: 0,
++                runtimeRetries: 0
++            };
++            this.slots.set(slot, state);
++        }
++        return state;
++    }
++
++    prepare(
++        slot: SubtitleSlot,
++        state: SubtitleSlotState,
++        trackIndex: number,
++        factory: SubtitleRendererFactory
++    ) {
++        state.loading?.cancel();
++
++        const generation = Symbol(String(trackIndex));
++        const cancellationCallbacks = new Set<() => void>();
++        let cancelled = false;
++        let preparationError: unknown;
++        const cancel = () => {
++            if (cancelled) return;
++            cancelled = true;
++            for (const callback of cancellationCallbacks) {
++                try {
++                    callback();
++                } catch (error) {
++                    console.debug('Unable to cancel subtitle loading', error);
++                }
++            }
++            cancellationCallbacks.clear();
++        };
++        const isCurrent = () => !this.disposed
++            && !cancelled
++            && this.slots.get(slot) === state
++            && state.desiredTrackIndex === trackIndex
++            && state.loading?.generation === generation;
++        const request: SubtitleLoadRequest = {
++            isCurrent,
++            onCancel: (callback) => {
++                if (cancelled) {
++                    callback();
++                    return () => undefined;
++                }
++                cancellationCallbacks.add(callback);
++                return () => cancellationCallbacks.delete(callback);
++            },
++            reportRuntimeError: (error) => {
++                if (state.active?.generation === generation) {
++                    this.handleRuntimeError(slot, generation, error);
++                } else if (state.loading?.generation === generation) {
++                    preparationError = error;
++                }
++            }
++        };
++
++        const promise = Promise.resolve().then(async () => {
++            let renderer: SubtitleRenderer | undefined;
++            try {
++                if (!isCurrent()) return;
++                renderer = await factory(request);
++                if (preparationError) throw preparationError;
++                if (!isCurrent()) {
++                    this.safeDispose(renderer);
++                    return;
++                }
++
++                renderer.setOffset(state.offsetSeconds);
++                const snapshot = this.clock.snapshot('selection');
++                renderer.activate(snapshot);
++                renderer.update(snapshot);
++                if (preparationError) throw preparationError;
++
++                if (!isCurrent()) {
++                    this.safeDispose(renderer);
++                    return;
++                }
++
++                const previous = state.active;
++                state.active = {
++                    generation,
++                    trackIndex,
++                    factory,
++                    renderer
++                };
++                state.loading = undefined;
++                this.safeDispose(previous?.renderer);
++                this.onStateChange?.({ slot, trackIndex, state: 'active' });
++            } catch (error) {
++                this.safeDispose(renderer);
++                if (!isCurrent()) return;
++
++                state.loading = undefined;
++                this.restoreAfterSelectionFailure(slot, state, trackIndex, error);
++            } finally {
++                cancellationCallbacks.clear();
++            }
++        });
++
++        state.loading = {
++            generation,
++            trackIndex,
++            cancel,
++            promise
++        };
++        this.onStateChange?.({ slot, trackIndex, state: 'loading' });
++        return promise;
++    }
++
++    handleRuntimeError(slot: SubtitleSlot, generation: symbol, error: unknown) {
++        const state = this.slots.get(slot);
++        const active = state?.active;
++        if (!state || !active || active.generation !== generation) return;
++
++        state.active = undefined;
++        this.safeDispose(active.renderer);
++
++        // A replacement may already be loading while the previous renderer
++        // fails. Keep that newer selection authoritative instead of clearing
++        // or restarting it with the old track's factory.
++        if (
++            state.loading
++            && state.desiredTrackIndex !== active.trackIndex
++        ) {
++            return;
++        }
++
++        if (
++            state.desiredTrackIndex === active.trackIndex
++            && state.factory
++            && state.runtimeRetries < MAX_RUNTIME_RETRIES
++        ) {
++            state.runtimeRetries++;
++            void this.prepare(slot, state, active.trackIndex, state.factory);
++            return;
++        }
++
++        state.desiredTrackIndex = undefined;
++        state.factory = undefined;
++        this.onStateChange?.({
++            slot,
++            trackIndex: active.trackIndex,
++            state: 'failed',
++            error,
++            restoredTrackIndex: -1
++        });
++    }
++
++    restoreAfterSelectionFailure(
++        slot: SubtitleSlot,
++        state: SubtitleSlotState,
++        trackIndex: number,
++        error: unknown
++    ) {
++        const previous = state.active;
++        const restoredTrackIndex = previous?.trackIndex ?? -1;
++        state.desiredTrackIndex = previous?.trackIndex;
++        state.factory = previous?.factory;
++        state.runtimeRetries = 0;
++        this.onStateChange?.({
++            slot,
++            trackIndex,
++            state: 'failed',
++            error,
++            restoredTrackIndex
++        });
++    }
++
++    safeDispose(renderer?: SubtitleRenderer) {
++        if (!renderer) return;
++        try {
++            renderer.dispose();
++        } catch (error) {
++            console.debug('Unable to dispose subtitle renderer', error);
++        }
++    }
++
++    onClock = (snapshot: SubtitleClockSnapshot) => {
++        for (const [ slot, state ] of this.slots) {
++            const active = state.active;
++            if (!active) continue;
++
++            try {
++                active.renderer.update(snapshot);
++            } catch (error) {
++                this.handleRuntimeError(slot, active.generation, error);
++            }
++        }
++    };
++}
+diff --git a/src/plugins/htmlVideoPlayer/subtitles/types.ts b/src/plugins/htmlVideoPlayer/subtitles/types.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3997616c555fce4e3202d4612d45a86f327505ef
+--- /dev/null
++++ b/src/plugins/htmlVideoPlayer/subtitles/types.ts
+@@ -0,0 +1,60 @@
++export const PRIMARY_SUBTITLE_SLOT = 0;
++export const SECONDARY_SUBTITLE_SLOT = 1;
++
++export type SubtitleSlot = typeof PRIMARY_SUBTITLE_SLOT | typeof SECONDARY_SUBTITLE_SLOT;
++
++export type SubtitleClockReason =
++    | 'frame'
++    | 'selection'
++    | 'manual'
++    | 'playing'
++    | 'pause'
++    | 'waiting'
++    | 'stalled'
++    | 'waitingforkey'
++    | 'seeking'
++    | 'seeked'
++    | 'ratechange'
++    | 'loadstart'
++    | 'emptied'
++    | 'loadeddata'
++    | 'canplay'
++    | 'loadedmetadata';
++
++export interface SubtitleClockSnapshot {
++    currentTime: number;
++    paused: boolean;
++    playbackRate: number;
++    reason: SubtitleClockReason;
++}
++
++export interface SubtitleRenderer {
++    activate(snapshot: SubtitleClockSnapshot): void;
++    update(snapshot: SubtitleClockSnapshot): void;
++    setOffset(offsetSeconds: number): void;
++    dispose(): void;
++}
++
++export interface SubtitleLoadRequest {
++    isCurrent(): boolean;
++    onCancel(callback: () => void): () => void;
++    reportRuntimeError(error: unknown): void;
++}
++
++export type SubtitleRendererFactory = (
++    request: SubtitleLoadRequest
++) => Promise<SubtitleRenderer>;
++
++export interface SubtitlePipelineStateChange {
++    slot: SubtitleSlot;
++    trackIndex: number;
++    state: 'loading' | 'active' | 'failed' | 'disposed';
++    error?: unknown;
++    restoredTrackIndex?: number;
++}
++
++export interface SubtitleTrackEvent {
++    StartPositionTicks: number;
++    EndPositionTicks: number;
++    Text?: string | null;
++}
+diff --git a/src/types/libass-wasm.d.ts b/src/types/libass-wasm.d.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..700e7a24c3a9e59281d2098cc81cd0efb51e3cf9
+--- /dev/null
++++ b/src/types/libass-wasm.d.ts
+@@ -0,0 +1,4 @@
++declare module '@jellyfin/libass-wasm' {
++    const SubtitlesOctopus: new (options: Record<string, unknown>) => unknown;
++    export default SubtitlesOctopus;
++}

@@ -1,4 +1,4 @@
-name: Build Bridge-patched Jellyfin Web
+name: Build enhanced Jellyfin Web
 
 on:
   schedule:
@@ -19,7 +19,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: bridge-release
+  group: enhancement-release
   cancel-in-progress: false
 
 jobs:
@@ -53,14 +53,17 @@ jobs:
             fi
           fi
           test -n "$tag"
-          bridge_tag="${tag}-bridge.1"
-          if gh release view "$bridge_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "A Bridge release for $tag already exists."
+          patch_version="$(tr -d '[:space:]' < automation/patches/version.txt)"
+          [[ "$patch_version" =~ ^[0-9]{8}\.[1-9][0-9]*$ ]]
+          release_tag="${tag}.patch.${patch_version}"
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Patch build $patch_version for $tag already exists."
             echo "publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "bridge_tag=$bridge_tag" >> "$GITHUB_OUTPUT"
+          echo "patch_version=$patch_version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - name: Check out and patch official Jellyfin Web
@@ -71,7 +74,7 @@ jobs:
           set -euo pipefail
           git clone https://github.com/jellyfin/jellyfin-web.git upstream-web
           git -C upstream-web checkout "$UPSTREAM_TAG"
-          git -C upstream-web apply --3way --whitespace=error ../automation/patches/jellyfin-web-enhancements.patch
+          git -C upstream-web apply --3way --whitespace=error-all ../automation/patches/jellyfin-web-enhancements.patch
           git -C upstream-web diff --check
 
       - name: Setup node environment
@@ -88,12 +91,20 @@ jobs:
         working-directory: upstream-web
         run: npm ci
 
-      - name: Verify Bridge integration
+      - name: Verify Web enhancements
         if: steps.upstream.outputs.publish == 'true'
         working-directory: upstream-web
         run: |
+          set -euo pipefail
           npm run build:check
-          npm test -- --run src/utils/subtitleFontBridgeResolver.test.ts
+          npm test -- --run \
+            src/plugins/htmlVideoPlayer/subtitles \
+            src/utils/subtitleFontBridgeResolver.test.ts
+          npx eslint \
+            src/plugins/htmlVideoPlayer/plugin.js \
+            src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts \
+            "src/plugins/htmlVideoPlayer/subtitles/**/*.ts" \
+            src/utils/subtitleFontBridgeResolver.test.ts
 
       - name: Build production Web assets
         if: steps.upstream.outputs.publish == 'true'
@@ -104,31 +115,50 @@ jobs:
         if: steps.upstream.outputs.publish == 'true'
         env:
           UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
-          BRIDGE_TAG: ${{ steps.upstream.outputs.bridge_tag }}
+          PATCH_VERSION: ${{ steps.upstream.outputs.patch_version }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
         run: |
           set -euo pipefail
-          branch="bridge/$UPSTREAM_TAG"
+          branch="enhancements/${UPSTREAM_TAG}-patch-${PATCH_VERSION}"
+          asset_base="jellyfin-web-${RELEASE_TAG}-dist"
           git -C upstream-web config user.name 'github-actions[bot]'
           git -C upstream-web config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git -C upstream-web add src/apps/legacy/controllers/playback/video/index.js src/components/playback/skipbutton.scss src/components/playback/skipsegment.ts src/plugins/htmlVideoPlayer/plugin.js src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts src/styles/videoosd.scss src/utils/subtitleFontBridgeResolver.test.ts
-          git -C upstream-web commit -m "feat: apply Subtitle Font Bridge to $UPSTREAM_TAG"
-          git -C upstream-web tag -a "$BRIDGE_TAG" -m "Subtitle Font Bridge build for $UPSTREAM_TAG"
+          git -C upstream-web add -A -- \
+            src/apps/legacy/controllers/playback/video/index.js \
+            src/components/playback/skipbutton.scss \
+            src/components/playback/skipsegment.ts \
+            src/plugins/htmlVideoPlayer/plugin.js \
+            src/plugins/htmlVideoPlayer/style.scss \
+            src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts \
+            src/plugins/htmlVideoPlayer/subtitles \
+            src/styles/videoosd.scss \
+            src/types/libass-wasm.d.ts \
+            src/utils/subtitleFontBridgeResolver.test.ts
+          git -C upstream-web diff --quiet
+          test -z "$(git -C upstream-web ls-files --others --exclude-standard)"
+          git -C upstream-web diff --cached --check
+          if git -C upstream-web diff --cached --quiet; then
+            echo 'The compatibility patch produced no source changes.' >&2
+            exit 1
+          fi
+          git -C upstream-web commit -m "feat: apply Web enhancements to $UPSTREAM_TAG"
+          git -C upstream-web tag -a "$RELEASE_TAG" -m "Patched Jellyfin Web build $PATCH_VERSION for $UPSTREAM_TAG"
           git -C upstream-web remote add target "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git -C upstream-web push --force target "HEAD:refs/heads/$branch" "refs/tags/$BRIDGE_TAG"
+          git -C upstream-web push --force target "HEAD:refs/heads/$branch" "refs/tags/$RELEASE_TAG"
           (
             cd upstream-web
-            zip -qr "../jellyfin-web-${UPSTREAM_TAG}-dist.zip" dist
-            sha256sum "../jellyfin-web-${UPSTREAM_TAG}-dist.zip" > "../jellyfin-web-${UPSTREAM_TAG}-dist.zip.sha256"
+            zip -qr "../${asset_base}.zip" dist
           )
+          sha256sum "${asset_base}.zip" > "${asset_base}.zip.sha256"
           release_flags=()
           if [[ "$UPSTREAM_TAG" == *-* ]]; then
             release_flags+=(--prerelease)
           fi
-          gh release create "$BRIDGE_TAG" \
-            "jellyfin-web-${UPSTREAM_TAG}-dist.zip" \
-            "jellyfin-web-${UPSTREAM_TAG}-dist.zip.sha256" \
+          gh release create "$RELEASE_TAG" \
+            "${asset_base}.zip" \
+            "${asset_base}.zip.sha256" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$branch" \
             "${release_flags[@]}" \
-            --title "Jellyfin Web $UPSTREAM_TAG" \
-            --notes "Automated Bridge build from official Jellyfin Web $UPSTREAM_TAG. The release ZIP contains the patched production dist assets."
+            --title "Jellyfin Web $RELEASE_TAG" \
+            --notes "Automated patch build $PATCH_VERSION based on official Jellyfin Web $UPSTREAM_TAG. The release ZIP contains the validated production dist assets."

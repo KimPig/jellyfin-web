@@ -174,7 +174,7 @@ describe('AssRendererAdapter', () => {
 
         await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
         octopusMock.instances[0].options.onError(new Error('font failure'));
-        await vi.runAllTimersAsync();
+        await vi.advanceTimersByTimeAsync(0);
         await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(2));
         octopusMock.instances[1].options.onReady();
         const renderer = await rendererPromise;
@@ -217,6 +217,20 @@ describe('AssRendererAdapter', () => {
         request.cancel();
 
         await expect(rendererPromise).rejects.toThrow('cancelled');
+        expect(octopusMock.instances[0].disposed).toBe(true);
+        expect(parent.querySelector('.subtitle-pipeline-ass')).toBeNull();
+    });
+    it('times out an ASS worker that never becomes ready', async () => {
+        vi.useFakeTimers();
+        const { parent, video } = createVideo();
+        const request = createRequest();
+        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
+        const rejection = expect(rendererPromise).rejects.toThrow('did not become ready within 10 seconds');
+
+        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
+        await vi.advanceTimersByTimeAsync(10_000);
+        await rejection;
+
         expect(octopusMock.instances[0].disposed).toBe(true);
         expect(parent.querySelector('.subtitle-pipeline-ass')).toBeNull();
     });

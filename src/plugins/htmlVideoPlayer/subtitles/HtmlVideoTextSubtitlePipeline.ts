@@ -15,6 +15,7 @@ import type {
 
 const ASS_SUBTITLE_CODECS = [ 'ssa', 'ass' ];
 const SUBTITLE_DATA_TIMEOUT_MS = 30_000;
+const ASS_RESOURCE_TIMEOUT_MS = 5_000;
 const SUPPORTED_FONT_MIME_TYPES = [
     'application/vnd.ms-opentype',
     'application/x-truetype-font',
@@ -76,9 +77,45 @@ interface RendererAttemptState {
     useAssFallbackFonts: boolean;
 }
 
+interface EncodingConfiguration {
+    EnableFallbackFont?: boolean;
+}
+
+interface AssRendererResources {
+    bridgeFontUrls: string[];
+    combinedFontUrls: string[];
+    bridgeFullyResolved: boolean;
+    workerUrl: string;
+    legacyWorkerUrl: string;
+}
+
+async function resolveWithFallback<T>(
+    promise: Promise<T>,
+    fallback: T,
+    description: string
+) {
+    let timeout: number | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((_resolve, reject) => {
+                timeout = window.setTimeout(() => {
+                    reject(new Error(`${description} timed out.`));
+                }, ASS_RESOURCE_TIMEOUT_MS);
+            })
+        ]);
+    } catch (error) {
+        console.debug(`${description} is unavailable; continuing without it.`, error instanceof Error ? error.message : error);
+        return fallback;
+    } finally {
+        if (timeout !== undefined) window.clearTimeout(timeout);
+    }
+}
+
 export class HtmlVideoTextSubtitlePipeline {
     readonly options: HtmlVideoTextSubtitlePipelineOptions;
     readonly pipeline: TextSubtitlePipeline;
+    readonly assResourcePromises = new Map<number, Promise<AssRendererResources>>();
 
     constructor(options: HtmlVideoTextSubtitlePipelineOptions) {
         this.options = options;
@@ -124,6 +161,7 @@ export class HtmlVideoTextSubtitlePipeline {
     }
 
     dispose() {
+        this.assResourcePromises.clear();
         this.pipeline.dispose();
     }
 
@@ -195,57 +233,23 @@ export class HtmlVideoTextSubtitlePipeline {
             throw new Error('Unable to resolve the Jellyfin API client');
         }
         const videoStream = mediaSource.MediaStreams.find(stream => stream.Type === 'Video');
-        const embeddedFonts = (mediaSource.MediaAttachments || [])
-            .filter(attachment => attachment.MimeType && SUPPORTED_FONT_MIME_TYPES.includes(attachment.MimeType))
-            .map(attachment => apiClient.getUrl(attachment.DeliveryUrl));
-        const fallbackFontList = apiClient.getUrl('/FallbackFont/Fonts', {
-            ApiKey: apiClient.accessToken()
-        });
-        const workerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`;
-        const legacyWorkerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`;
-        const [
-            config,
-            resolvedWorkerUrl,
-            resolvedLegacyWorkerUrl,
-            bridge
-        ] = await Promise.all([
-            apiClient.getNamedConfiguration('encoding'),
-            this.options.resolveUrl(workerUrl),
-            this.options.resolveUrl(legacyWorkerUrl),
-            resolveSubtitleFontBridge(apiClient, item.Id, mediaSource.Id, track.Index)
-        ]);
+        const resources = await this.getAssRendererResources(track, playbackOptions, apiClient);
 
         if (!request.isCurrent()) {
             throw new Error('Subtitle load was cancelled');
         }
-
-        const resolvedFonts = [ ...bridge.fontUrls ];
-        if (config.EnableFallbackFont) {
-            const fontFiles = await apiClient.getJSON(fallbackFontList);
-            if (!request.isCurrent()) {
-                throw new Error('Subtitle load was cancelled');
-            }
-
-            for (const font of fontFiles || []) {
-                resolvedFonts.push(apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
-                    ApiKey: apiClient.accessToken()
-                }));
-            }
-        }
-
-        const combinedFonts = [ ...new Set([ ...embeddedFonts, ...resolvedFonts ]) ];
-        const useBridgeFonts = bridge.fullyResolved && !attemptState.useAssFallbackFonts;
+        const useBridgeFonts = resources.bridgeFullyResolved && !attemptState.useAssFallbackFonts;
         try {
             return await createAssRendererAdapter({
                 videoElement: this.videoElement,
                 subtitleUrl: this.options.getSubtitleUrl(track, item),
-                fonts: useBridgeFonts ? [ ...new Set(resolvedFonts) ] : combinedFonts,
-                fallbackFonts: useBridgeFonts ? combinedFonts : undefined,
+                fonts: useBridgeFonts ? resources.bridgeFontUrls : resources.combinedFontUrls,
+                fallbackFonts: useBridgeFonts ? resources.combinedFontUrls : undefined,
                 onRuntimeFallbackRequested: () => {
                     attemptState.useAssFallbackFonts = true;
                 },
-                workerUrl: resolvedWorkerUrl,
-                legacyWorkerUrl: resolvedLegacyWorkerUrl,
+                workerUrl: resources.workerUrl,
+                legacyWorkerUrl: resources.legacyWorkerUrl,
                 baseTimeOffsetSeconds: (playbackOptions.transcodingOffsetTicks || 0) / 10_000_000,
                 targetFps: videoStream?.ReferenceFrameRate || 24,
                 request
@@ -256,5 +260,72 @@ export class HtmlVideoTextSubtitlePipeline {
             }
             throw error;
         }
+    }
+
+    getAssRendererResources(
+        track: SubtitleTrack,
+        playbackOptions: PlaybackOptions,
+        apiClient: NonNullable<ReturnType<typeof ServerConnections.getApiClient>>
+    ) {
+        const cached = this.assResourcePromises.get(track.Index);
+        if (cached) return cached;
+
+        const resources = this.loadAssRendererResources(track, playbackOptions, apiClient);
+        this.assResourcePromises.set(track.Index, resources);
+        void resources.catch(() => {
+            if (this.assResourcePromises.get(track.Index) === resources) {
+                this.assResourcePromises.delete(track.Index);
+            }
+        });
+        return resources;
+    }
+
+    async loadAssRendererResources(
+        track: SubtitleTrack,
+        playbackOptions: PlaybackOptions,
+        apiClient: NonNullable<ReturnType<typeof ServerConnections.getApiClient>>
+    ): Promise<AssRendererResources> {
+        const { item, mediaSource } = playbackOptions;
+        const embeddedFonts = (mediaSource.MediaAttachments || [])
+            .filter(attachment => attachment.MimeType && SUPPORTED_FONT_MIME_TYPES.includes(attachment.MimeType))
+            .map(attachment => apiClient.getUrl(attachment.DeliveryUrl));
+        const workerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`;
+        const legacyWorkerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`;
+        const [ config, resolvedWorkerUrl, resolvedLegacyWorkerUrl, bridge ] = await Promise.all([
+            resolveWithFallback(
+                apiClient.getNamedConfiguration('encoding') as Promise<EncodingConfiguration>,
+                {},
+                'Jellyfin encoding configuration request'
+            ),
+            this.options.resolveUrl(workerUrl),
+            this.options.resolveUrl(legacyWorkerUrl),
+            resolveSubtitleFontBridge(apiClient, item.Id, mediaSource.Id, track.Index)
+        ]);
+
+        const resolvedFonts = [ ...bridge.fontUrls ];
+        if (config.EnableFallbackFont) {
+            const fallbackFontList = apiClient.getUrl('/FallbackFont/Fonts', {
+                ApiKey: apiClient.accessToken()
+            });
+            const fontFiles = await resolveWithFallback<Array<{ Name: string }>>(
+                apiClient.getJSON(fallbackFontList),
+                [],
+                'Jellyfin fallback font list request'
+            );
+            for (const font of fontFiles) {
+                resolvedFonts.push(apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
+                    ApiKey: apiClient.accessToken()
+                }));
+            }
+        }
+
+        const bridgeFontUrls = [ ...new Set(resolvedFonts) ];
+        return {
+            bridgeFontUrls,
+            combinedFontUrls: [ ...new Set([ ...embeddedFonts, ...bridgeFontUrls ]) ],
+            bridgeFullyResolved: bridge.fullyResolved,
+            workerUrl: resolvedWorkerUrl,
+            legacyWorkerUrl: resolvedLegacyWorkerUrl
+        };
     }
 }

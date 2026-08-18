@@ -114,7 +114,7 @@ describe('Subtitle Font Bridge resolver', () => {
         vi.spyOn(console, 'debug').mockImplementation(() => undefined);
 
         const resultPromise = resolveSubtitleFontBridge(apiClient, 'item', 'source', 4);
-        await vi.advanceTimersByTimeAsync(10_000);
+        await vi.advanceTimersByTimeAsync(5_000);
 
         await expect(resultPromise).resolves.toEqual({ fontUrls: [], fullyResolved: false });
     });

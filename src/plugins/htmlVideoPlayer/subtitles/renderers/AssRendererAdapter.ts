@@ -7,6 +7,7 @@ import type {
 const PRESCALE_FACTOR = 0.8;
 const PRESCALE_HEIGHT_LIMIT = 1080;
 const MAX_RENDER_HEIGHT = 2160;
+const RENDERER_READY_TIMEOUT_MS = 10_000;
 
 export function computeAssRenderSize(width: number, height: number, pixelRatio: number) {
     const sourceWidth = width * pixelRatio;
@@ -279,7 +280,14 @@ export async function createAssRendererAdapter(options: AssRendererOptions) {
         let renderer: SubtitlesOctopusInstance | undefined;
         let fontSetIndex = 0;
         let settled = false;
+        let readyTimeout: number | undefined;
         let unsubscribeCancel: () => void = () => undefined;
+
+        const clearReadyTimeout = () => {
+            if (readyTimeout === undefined) return;
+            window.clearTimeout(readyTimeout);
+            readyTimeout = undefined;
+        };
 
         const disposePending = () => {
             try {
@@ -292,6 +300,7 @@ export async function createAssRendererAdapter(options: AssRendererOptions) {
         const rejectOnce = (error: unknown) => {
             if (settled) return;
             settled = true;
+            clearReadyTimeout();
             unsubscribeCancel();
             disposePending();
             host.remove();
@@ -303,6 +312,7 @@ export async function createAssRendererAdapter(options: AssRendererOptions) {
 
                 const adapter = new AssRendererAdapter(options, host, canvas, renderer);
                 settled = true;
+                clearReadyTimeout();
                 unsubscribeCancel();
                 resolve(adapter);
             });
@@ -316,6 +326,7 @@ export async function createAssRendererAdapter(options: AssRendererOptions) {
             }
 
             disposePending();
+            clearReadyTimeout();
             fontSetIndex++;
             if (fontSetIndex < fontSets.length) {
                 setTimeout(createRenderer, 0);
@@ -346,6 +357,9 @@ export async function createAssRendererAdapter(options: AssRendererOptions) {
                     resizeVariation: 0.2,
                     renderAhead: 0
                 });
+                readyTimeout = window.setTimeout(() => {
+                    rejectOnce(new Error(`ASS renderer did not become ready within ${RENDERER_READY_TIMEOUT_MS / 1000} seconds.`));
+                }, RENDERER_READY_TIMEOUT_MS);
             } catch (error) {
                 rejectOnce(error);
             }

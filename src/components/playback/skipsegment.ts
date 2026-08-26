@@ -9,7 +9,6 @@ import { EventType } from 'constants/eventType';
 import './skipbutton.scss';
 import dom from 'utils/dom';
 import globalize from 'lib/globalize';
-import * as userSettings from 'scripts/settings/userSettings';
 import focusManager from 'components/focusManager';
 import layoutManager from 'components/layoutManager';
 
@@ -38,12 +37,16 @@ class SkipSegment extends PlaybackSubscriber {
     private skipElement: HTMLButtonElement | null;
     private currentSegment: MediaSegmentDto | null | undefined;
     private hideTimeout: ReturnType<typeof setTimeout> | null | undefined;
+    private upNextContainer: HTMLElement | null = null;
+    private upNextObserver: MutationObserver | null = null;
+    private upNextResizeObserver: ResizeObserver | null = null;
 
     constructor(playbackManager: PlaybackManager) {
         super(playbackManager);
 
         this.skipElement = null;
         this.onOsdChanged = this.onOsdChanged.bind(this);
+        this.updateSkipButtonPosition = this.updateSkipButtonPosition.bind(this);
     }
 
     createSkipElement() {
@@ -67,8 +70,62 @@ class SkipSegment extends PlaybackSubscriber {
                         }
                     }
                 });
+                this.observeUpNextDialog();
             }
         }
+    }
+
+    private observeUpNextDialog() {
+        const upNextContainer = document.querySelector<HTMLElement>('.upNextContainer');
+        if (this.upNextContainer === upNextContainer) {
+            this.updateSkipButtonPosition();
+            return;
+        }
+
+        this.upNextObserver?.disconnect();
+        this.upNextResizeObserver?.disconnect();
+        window.removeEventListener('resize', this.updateSkipButtonPosition);
+        this.upNextContainer = upNextContainer;
+
+        if (!upNextContainer) {
+            this.updateSkipButtonPosition();
+            return;
+        }
+
+        this.upNextObserver = new MutationObserver(this.updateSkipButtonPosition);
+        this.upNextObserver.observe(upNextContainer, {
+            attributes: true,
+            attributeFilter: [ 'class' ],
+            childList: true,
+            subtree: true
+        });
+        this.upNextResizeObserver = new ResizeObserver(this.updateSkipButtonPosition);
+        this.upNextResizeObserver.observe(upNextContainer);
+        window.addEventListener('resize', this.updateSkipButtonPosition);
+        this.updateSkipButtonPosition();
+    }
+
+    private updateSkipButtonPosition() {
+        const skipContainer = this.skipElement?.closest<HTMLElement>('.skip-button-container');
+        const upNextContainer = this.upNextContainer;
+        if (!skipContainer || !upNextContainer || !this.currentSegment
+            || upNextContainer.classList.contains('hide')
+            || upNextContainer.classList.contains('upNextDialog-hidden')) {
+            skipContainer?.classList.remove('skip-button-container-up-next');
+            skipContainer?.style.removeProperty('--skip-button-bottom');
+            return;
+        }
+
+        const bounds = upNextContainer.getBoundingClientRect();
+        if (bounds.width === 0 || bounds.height === 0) {
+            return;
+        }
+
+        const gap = 16;
+        const defaultBottom = 8 * 16;
+        const bottom = Math.max(defaultBottom, window.innerHeight - bounds.top + gap);
+        skipContainer.style.setProperty('--skip-button-bottom', `${Math.ceil(bottom)}px`);
+        skipContainer.classList.add('skip-button-container-up-next');
     }
 
     setButtonText() {
@@ -101,6 +158,7 @@ class SkipSegment extends PlaybackSubscriber {
             }
 
             requestAnimationFrame(() => {
+                this.updateSkipButtonPosition();
                 elem.classList.remove('skip-button-hidden');
 
                 if (!options.keep) {
@@ -149,14 +207,6 @@ class SkipSegment extends PlaybackSubscriber {
     }
 
     onPromptSkip(e: Event, segment: MediaSegmentDto) {
-        if (this.player && segment.EndTicks != null
-            && segment.EndTicks >= this.playbackManager.currentItem(this.player).RunTimeTicks
-            && this.playbackManager.getNextItem()
-            && userSettings.enableNextVideoInfoOverlay()
-        ) {
-            // Don't display button when UpNextDialog is expected.
-            return;
-        }
         if (!this.currentSegment) {
             this.currentSegment = segment;
 
@@ -186,6 +236,7 @@ class SkipSegment extends PlaybackSubscriber {
         if (this.playbackManager.getCurrentPlayer()) {
             Events.off(document, EventType.SHOW_VIDEO_OSD, this.onOsdChanged);
             Events.on(document, EventType.SHOW_VIDEO_OSD, this.onOsdChanged);
+            this.observeUpNextDialog();
         }
     }
 

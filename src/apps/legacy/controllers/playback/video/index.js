@@ -1243,7 +1243,7 @@ export default function (view) {
         indicator.setAttribute('aria-label', '2× playback speed');
 
         const icon = document.createElement('span');
-        icon.className = 'material-icons fast_forward';
+        icon.className = 'material-icons ff-indicator-icon';
 
         const label = document.createElement('span');
         label.className = 'ff-indicator-label';

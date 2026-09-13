@@ -27,6 +27,62 @@ function createPipeline() {
 }
 
 describe('TextSubtitlePipeline', () => {
+    it('retries initial activation once and keeps the previous track until recovery', async () => {
+        const pipeline = createPipeline();
+        const previous = createRenderer();
+        await pipeline.select(0, 1, async () => previous);
+        const failed = createRenderer();
+        failed.activate.mockRejectedValue(new Error('first frame timed out'));
+        const recovered = createRenderer();
+        const activation = deferred<void>();
+        recovered.activate.mockReturnValue(activation.promise);
+        const factory = vi.fn().mockResolvedValueOnce(failed).mockResolvedValueOnce(recovered);
+        const selection = pipeline.select(0, 2, factory);
+        await vi.waitFor(() => expect(recovered.activate).toHaveBeenCalledOnce());
+        expect(failed.dispose).toHaveBeenCalledOnce();
+        expect(previous.dispose).not.toHaveBeenCalled();
+        expect(pipeline.getActiveTrackIndex(0)).toBe(1);
+        activation.resolve();
+        await selection;
+        expect(pipeline.getActiveTrackIndex(0)).toBe(2);
+        expect(previous.dispose).toHaveBeenCalledOnce();
+        expect(factory).toHaveBeenCalledTimes(2);
+        pipeline.dispose();
+    });
+
+    it('bounds initial activation retries and restores the previous track', async () => {
+        const changes = vi.fn();
+        const pipeline = new TextSubtitlePipeline(document.createElement('video'), { onStateChange: changes });
+        const previous = createRenderer();
+        await pipeline.select(0, 1, async () => previous);
+        const factory = vi.fn(async () => {
+            const renderer = createRenderer();
+            renderer.activate.mockRejectedValue(new Error('worker stopped'));
+            return renderer;
+        });
+        await pipeline.select(0, 2, factory);
+        expect(factory).toHaveBeenCalledTimes(2);
+        expect(pipeline.getActiveTrackIndex(0)).toBe(1);
+        expect(changes).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'failed', restoredTrackIndex: 1 }));
+        pipeline.dispose();
+    });
+
+    it('does not retry activation after the user clears the track', async () => {
+        const pipeline = createPipeline();
+        const renderer = createRenderer();
+        const activation = deferred<void>();
+        renderer.activate.mockReturnValue(activation.promise);
+        const factory = vi.fn(async () => renderer);
+        const selection = pipeline.select(0, 2, factory);
+        await vi.waitFor(() => expect(renderer.activate).toHaveBeenCalledOnce());
+        pipeline.clear();
+        activation.reject(new Error('cancelled'));
+        await selection;
+        expect(factory).toHaveBeenCalledOnce();
+        expect(pipeline.getActiveTrackIndex(0)).toBeUndefined();
+        pipeline.dispose();
+    });
+
     it('keeps the active subtitle visible until its replacement is ready', async () => {
         const pipeline = createPipeline();
         const first = createRenderer();

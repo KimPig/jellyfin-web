@@ -132,7 +132,11 @@ export class AssRendererAdapter implements SubtitleRenderer {
             + this.options.baseTimeOffsetSeconds
             + this.offsetSeconds;
 
-        if (snapshot.reason !== 'frame') this.invalidate();
+        // Rate/buffering changes preserve the same timeline and visible frame.
+        // Only discontinuities must invalidate an in-flight worker response.
+        if ([ 'selection', 'manual', 'seeking', 'seeked', 'loadstart', 'emptied' ].includes(snapshot.reason)) {
+            this.invalidate();
+        }
         this.resize();
         this.requestFrame();
     }
@@ -193,9 +197,10 @@ export class AssRendererAdapter implements SubtitleRenderer {
 
         try {
             const current = pending.epoch === this.epoch;
-            const fresh = !this.activation
-                || Math.abs(pending.time - (this.latestTime ?? pending.time)) < 0.25;
-            if (current && fresh) {
+            // Accept continuous playback even if rendering lags at 2x. A fixed
+            // media-time freshness limit can starve activation indefinitely.
+            // requestFrame below immediately catches up to the latest time.
+            if (current) {
                 this.paint(event.data);
                 this.lastRenderedTime = pending.time;
                 this.host.style.visibility = 'visible';

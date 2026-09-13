@@ -34,13 +34,13 @@ daily and can also be started manually. For each unprocessed upstream tag it:
 3. runs TypeScript checks, every custom subtitle test, the Bridge resolver
    tests, and ESLint on the integration files;
 4. builds production `dist` assets;
-5. pushes a versioned source branch and `<upstream-tag>.patch.<YYYYMMDD.N>`
-   tag; and
+5. pushes an `<upstream-tag>.patch.<YYYYMMDD.N>` tag containing the patched
+   source, without creating a release branch; and
 6. creates a GitHub Release containing
    `jellyfin-web-<complete-release-tag>-dist.zip` and its SHA-256 file.
 
 If the official Web changes the relevant playback code and the patch no longer
-applies or validates, the workflow fails before any branch, tag, or release is
+applies or validates, the workflow fails before any tag or release is
 created. Update the patch deliberately for that upstream version, then re-run
 the workflow.
 
@@ -52,6 +52,12 @@ the previous subtitle. It uses the pinned libass worker's timestamped
 `oneshot-render` protocol, with no render-ahead cache or independent worker clock.
 Late frames from before a seek/resize are discarded. A stalled worker is retried
 once, and clock progress can recover buffering without a second `playing` event.
+Rate and buffering changes preserve the current canvas and in-flight frames.
+Continuous playback accepts a delayed first frame and immediately requests the
+latest timestamp, avoiding activation starvation at 2x. First-frame failures
+share the bounded retry budget with runtime failures, retaining the previous
+track during recovery. The hold indicator uses a dedicated icon class so themes
+that replace `fast_forward` with a skip icon do not affect it.
 
 `scripts/test-ass-browser.mjs` exercises the real WASM and legacy workers in
 headless Chromium with delayed ASS/font responses. It checks canvas pixels
@@ -59,6 +65,10 @@ without taking screenshots. It requires `ffmpeg` and Playwright 1.63.0; install
 Playwright outside the project and set `PLAYWRIGHT_MODULE` to its `index.mjs`
 path. `CHROMIUM_EXECUTABLE` optionally selects an existing Chromium executable.
 The release workflow runs this test before building production assets.
+The fixture also runs the actual hold handlers with mouse down/up during slow
+startup and SRT-to-ASS switching, delays worker requests by 200ms, checks both
+release timings around the first frame, and stops a worker before activation.
+OSD services are stubbed; this is not a full authenticated-server playback test.
 
 `patches/upstream-base.txt` records the official tag from which the current
 source changes were developed. After changing an enhancement, regenerate the
@@ -83,5 +93,4 @@ The workflow skips a release when that complete tag already exists, even if its
 daily schedule runs again before Jellyfin Web publishes another official tag.
 
 The workflow needs the repository Actions setting **Workflow permissions** set
-to **Read and write permissions** so `GITHUB_TOKEN` can create branches, tags,
-and releases.
+to **Read and write permissions** so `GITHUB_TOKEN` can create tags and releases.

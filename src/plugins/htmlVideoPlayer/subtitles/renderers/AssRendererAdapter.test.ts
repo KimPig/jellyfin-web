@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TextSubtitlePipeline } from '../TextSubtitlePipeline';
-import type { SubtitleLoadRequest, SubtitleRenderer } from '../types';
+import type { SubtitleClockReason, SubtitleLoadRequest, SubtitleRenderer } from '../types';
 import { computeAssRenderSize, createAssRendererAdapter } from './AssRendererAdapter';
 
 interface MockOptions extends Record<string, unknown> {
@@ -108,7 +108,7 @@ function createOptions(request: SubtitleLoadRequest, videoElement: HTMLVideoElem
     };
 }
 
-const snapshot = (currentTime: number, reason: 'selection' | 'frame' | 'seeking' | 'seeked' | 'loadedmetadata' = 'frame') => (
+const snapshot = (currentTime: number, reason: SubtitleClockReason = 'frame') => (
     { currentTime, paused: false, playbackRate: 1, reason }
 );
 
@@ -211,12 +211,43 @@ describe('ASS worker lifecycle', () => {
         expect(octopus.worker.messages.filter(m => m.target === 'oneshot-render')).toHaveLength(2);
     });
 
-    it('refreshes a stale first frame to the latest playback time', async () => {
-        const { renderer, octopus } = await loadRenderer();
+    it('shows a delayed first frame at 2x and immediately requests the latest time', async () => {
+        const { renderer, octopus, parent } = await loadRenderer();
         const activation = renderer.activate(snapshot(1, 'selection'));
-        renderer.update(snapshot(10));
+        renderer.update({ ...snapshot(1.4, 'ratechange'), playbackRate: 2 });
         octopus.worker.frame();
-        expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(12);
+        await activation;
+        expect(parent.querySelector<HTMLElement>('.subtitle-pipeline-ass')?.style.visibility).toBe('visible');
+        expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(3.4);
+        octopus.worker.frame();
+    });
+
+    it.each([ 'ratechange', 'waiting', 'playing', 'pause', 'canplay', 'loadeddata', 'stalled', 'waitingforkey' ] as const)(
+        'preserves visible and in-flight frames across %s', async reason => {
+            const { renderer, octopus } = await loadRenderer();
+            const activation = renderer.activate(snapshot(1, 'selection'));
+            octopus.worker.frame();
+            await activation;
+            renderer.update(snapshot(1.1));
+            const pending = octopus.worker.messages.at(-1);
+            clearRect.mockClear();
+            renderer.update(snapshot(1.2, reason));
+            expect(clearRect).not.toHaveBeenCalled();
+            octopus.worker.frame(pending);
+            expect(clearRect).toHaveBeenCalledOnce();
+            expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(3.2);
+        }
+    );
+
+    it('discards pre-offset frames even during initial activation', async () => {
+        const { renderer, octopus, parent } = await loadRenderer();
+        const activation = renderer.activate(snapshot(1, 'selection'));
+        const pending = octopus.worker.messages.at(-1);
+        renderer.setOffset(4);
+        renderer.update(snapshot(1, 'manual'));
+        octopus.worker.frame(pending);
+        expect(parent.querySelector<HTMLElement>('.subtitle-pipeline-ass')?.style.visibility).toBe('hidden');
+        expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(7);
         octopus.worker.frame();
         await activation;
     });
@@ -309,13 +340,13 @@ describe('ASS worker lifecycle', () => {
         await rejection;
     });
 
-    it('bounds activation even when a slow worker keeps returning obsolete frames', async () => {
+    it('bounds activation when repeated seeks keep invalidating worker frames', async () => {
         vi.useFakeTimers();
         const { renderer, octopus } = await loadRenderer();
         const rejection = expect(renderer.activate(snapshot(0, 'selection'))).rejects.toThrow('within 10 seconds');
         for (let time = 1; time <= 9; time++) {
             await vi.advanceTimersByTimeAsync(1_000);
-            renderer.update(snapshot(time));
+            renderer.update(snapshot(time, 'seeking'));
             octopus.worker.frame();
         }
         await vi.advanceTimersByTimeAsync(1_000);

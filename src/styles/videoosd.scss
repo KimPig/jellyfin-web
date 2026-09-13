@@ -154,6 +154,10 @@
     font-size: 1.35em;
 }
 
+.ff-indicator-icon::before {
+    content: "\e01f";
+}
+
 .osdControls {
     pointer-events: all;
     flex-grow: 1;

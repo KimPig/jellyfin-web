@@ -1,9 +1,9 @@
 diff --git a/scripts/test-ass-browser.mjs b/scripts/test-ass-browser.mjs
 new file mode 100644
-index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f933091f97c
+index 0000000000000000000000000000000000000000..3e930b0f0ff637c7873d1f292f6caeebfbbc243d
 --- /dev/null
 +++ b/scripts/test-ass-browser.mjs
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,393 @@
 +/* eslint-disable compat/compat -- Developer test runs in Node 24 and current Chromium. */
 +import assert from 'node:assert/strict';
 +import { spawnSync } from 'node:child_process';
@@ -13,6 +13,8 @@ index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f93
 +import path from 'node:path';
 +import { fileURLToPath, pathToFileURL } from 'node:url';
 +import { build } from 'esbuild';
++import ts from 'typescript';
++import { compileString } from 'sass';
 +
 +// Optional tooling stays outside the production dependency lockfile.
 +// PLAYWRIGHT_MODULE can point to an external playwright/index.mjs installation.
@@ -28,6 +30,24 @@ index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f93
 +    '-t', '60', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', videoFile
 +], { windowsHide: true });
 +assert.equal(ffmpeg.status, 0, ffmpeg.stderr?.toString() || 'ffmpeg is required');
++
++// Exercise the actual hold handlers, with only their surrounding OSD services stubbed.
++const controller = ts.createSourceFile('video.js', await readFile(path.join(root,
++    'src/apps/legacy/controllers/playback/video/index.js'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
++const holdNames = new Set([
++    'supportsSpeedHold', 'createFastForwardIndicator', 'showFastForwardIndicator',
++    'hideFastForwardIndicator', 'beginSpeedHold', 'finishSpeedHold'
++]);
++const holdFunctions = [];
++function collectHoldFunctions(node) {
++    if (ts.isFunctionDeclaration(node) && holdNames.has(node.name?.text)) holdFunctions.push(node.getText(controller));
++    ts.forEachChild(node, collectHoldFunctions);
++}
++collectHoldFunctions(controller);
++assert.equal(holdFunctions.length, holdNames.size);
++const osdCss = compileString(await readFile(path.join(root, 'src/styles/videoosd.scss'), 'utf8'), {
++    loadPaths: [path.join(root, 'src/styles')]
++}).css;
 +
 +const bundled = await build({
 +    absWorkingDir: root,
@@ -52,6 +72,29 @@ index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f93
 +import { TextSubtitlePipeline } from './src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline';
 +import { TextEventRenderer } from './src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer';
 +const video = document.querySelector('video');
++const view = video.parentElement;
++const currentPlayer = video;
++let speedHoldSource, speedHoldPointerType, speedHoldPointerId, speedHoldPlayer;
++let speedHoldTimeout, fastForwardIndicatorElem;
++let speedHoldOriginalPlaybackRate = 1;
++let isSpeedHoldMode = false;
++const playbackManager = {
++    getSupportedPlaybackRates: () => [{ id: 1 }, { id: 2 }],
++    getPlaybackRate: player => player.playbackRate,
++    setPlaybackRate: (rate, player) => { player.playbackRate = rate; }
++};
++function hideOsd() {}
++function stopOsdHideTimer() {}
++function resetIdle() {}
++${holdFunctions.join('\n')}
++video.addEventListener('mousedown', () => beginSpeedHold('pointer', 'mouse', 1));
++window.addEventListener('mouseup', () => finishSpeedHold('pointer'));
++const postMessage = Worker.prototype.postMessage;
++Worker.prototype.postMessage = function(message, ...rest) {
++    if (message.target === 'oneshot-render' && window.renderDelay) {
++        setTimeout(() => postMessage.call(this, message, ...rest), window.renderDelay);
++    } else postMessage.call(this, message, ...rest);
++};
 +const changes = [];
 +let pipeline;
 +function reset() {
@@ -82,6 +125,7 @@ index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f93
 +    clear: () => pipeline.clear(),
 +    active: () => pipeline.getActiveTrackIndex(0),
 +    renderer: () => pipeline.slots.get(0)?.active?.renderer,
++    loadingRenderer: () => pipeline.slots.get(0)?.loading?.renderer,
 +    pixels: () => {
 +        const canvas = document.querySelector('.subtitle-pipeline-ass canvas');
 +        if (!canvas) return 0;
@@ -130,7 +174,10 @@ index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f93
 +        res.setHeader('Cache-Control', 'no-store');
 +        if (url.pathname === '/') {
 +            res.setHeader('Content-Type', 'text/html');
-+            res.end('<!doctype html><div style="position:relative;width:640px;height:360px"><video muted playsinline src="/fixture.mp4" style="width:100%;height:100%"></video></div><script src="/test.js"></script>');
++            res.end('<!doctype html><link rel="stylesheet" href="/test.css"><div style="position:relative;width:640px;height:360px"><video muted playsinline src="/fixture.mp4" style="width:100%;height:100%"></video></div><script src="/test.js"></script>');
++        } else if (url.pathname === '/test.css') {
++            res.setHeader('Content-Type', 'text/css');
++            res.end(osdCss + '\n.material-icons.fast_forward::before { content: "\\e057"; }');
 +        } else if (url.pathname === '/test.js') {
 +            res.setHeader('Content-Type', 'text/javascript');
 +            res.end(bundled.outputFiles[0].contents);
@@ -160,6 +207,37 @@ index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f93
 +    const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
 +    const errors = [];
 +    page.on('pageerror', error => errors.push(error.message));
++    for (const legacy of [false, true]) {
++        for (const releaseEarly of [false, true]) {
++            await page.goto(`http://127.0.0.1:${server.address().port}`);
++            await page.waitForFunction(() => window.fixture?.video.readyState >= 2);
++            await page.mouse.move(200, 200);
++            await page.evaluate(legacyWorker => {
++                window.renderDelay = 200;
++                window.seekCount = 0;
++                window.fixture.video.addEventListener('seeking', () => window.seekCount++);
++                window.fixture.video.play();
++                window.initialSelection = window.fixture.select(true, legacyWorker);
++            }, legacy);
++            await page.mouse.down();
++            await page.waitForFunction(() => window.fixture.video.playbackRate === 2);
++            const icon = await page.locator('.ff-indicator .material-icons').evaluate(element => ({
++                className: element.className,
++                content: getComputedStyle(element, '::before').content
++            }));
++            assert.ok(!icon.className.split(' ').includes('fast_forward'));
++            assert.ok(icon.content.includes('\ue01f'), 'Scyfin must not replace the hold icon with forward_30');
++            if (releaseEarly) await page.mouse.up();
++            await page.evaluate(() => window.initialSelection);
++            assert.equal(await page.evaluate(() => window.fixture.active()), 2);
++            assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0, 'delayed first ASS frame must appear at 2x');
++            if (!releaseEarly) await page.mouse.up();
++            await page.waitForFunction(() => window.fixture.video.playbackRate === 1);
++            assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0, 'releasing hold must preserve subtitles');
++            assert.equal(await page.evaluate(() => window.seekCount), 0);
++            console.log(`PASS: startup mouse hold/release, slow fonts and 200ms frames (${legacy ? 'legacy' : 'WASM'}, release ${releaseEarly ? 'before' : 'after'} first frame), Scyfin icon isolation`);
++        }
++    }
 +    await page.goto(`http://127.0.0.1:${server.address().port}`);
 +    await page.waitForFunction(() => window.fixture?.video.readyState >= 2);
 +    await page.evaluate(() => window.fixture.video.play());
@@ -168,14 +246,40 @@ index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f93
 +    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0, 'slow initial ASS must render without seeking');
 +    console.log('PASS: delayed ASS and font loading, initial playback without seek');
 +
++    await page.evaluate(() => {
++        window.fixture.clear();
++        window.renderDelay = 200;
++        window.initialRecovery = window.fixture.select();
++    });
++    await page.waitForFunction(() => window.fixture.loadingRenderer()?.pending);
++    await page.evaluate(() => {
++        window.failedInitialRenderer = window.fixture.loadingRenderer();
++        window.failedInitialRenderer.worker.terminate();
++    });
++    await page.evaluate(() => window.initialRecovery);
++    assert.equal(await page.evaluate(() => window.fixture.active()), 2);
++    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
++    assert.ok(await page.evaluate(() => window.fixture.renderer() !== window.failedInitialRenderer));
++    assert.equal(await page.locator('.subtitle-pipeline-ass').count(), 1);
++    console.log('PASS: a worker stopped before its first frame is recreated without seeking');
++
 +    await page.evaluate(() => window.fixture.text());
 +    await page.evaluate(() => {
 +        window.switching = window.fixture.select(true);
 +    });
 +    assert.equal(await page.evaluate(() => window.fixture.active()), 1);
++    await page.mouse.move(200, 200);
++    await page.mouse.down();
++    await page.waitForFunction(() => window.fixture.video.playbackRate === 2);
 +    await page.evaluate(() => window.switching);
 +    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
-+    console.log('PASS: delayed SRT to ASS keeps the previous track until rendering completes');
++    await page.mouse.up();
++    await page.waitForFunction(() => window.fixture.video.playbackRate === 1);
++    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
++    await page.evaluate(() => {
++        window.renderDelay = 0;
++    });
++    console.log('PASS: delayed SRT to ASS during mouse hold keeps the previous track until rendering completes');
 +
 +    await page.evaluate(() => {
 +        window.fixture.video.pause();
@@ -294,7 +398,7 @@ index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f93
 +}
 +/* eslint-enable compat/compat */
 diff --git a/src/apps/legacy/controllers/playback/video/index.js b/src/apps/legacy/controllers/playback/video/index.js
-index add9be8143a54cbafcebd1cf6997a927f213888d..ab1508286cc5503a0e3ebd35a13ce1b2c4a72a3a 100644
+index add9be8143a54cbafcebd1cf6997a927f213888d..81b553d7f3e9f3074bd906183a523b02edeccc66 100644
 --- a/src/apps/legacy/controllers/playback/video/index.js
 +++ b/src/apps/legacy/controllers/playback/video/index.js
 @@ -268,8 +268,19 @@ export default function (view) {
@@ -353,7 +457,7 @@ index add9be8143a54cbafcebd1cf6997a927f213888d..ab1508286cc5503a0e3ebd35a13ce1b2
 +        indicator.setAttribute('aria-label', '2× playback speed');
 +
 +        const icon = document.createElement('span');
-+        icon.className = 'material-icons fast_forward';
++        icon.className = 'material-icons ff-indicator-icon';
 +
 +        const label = document.createElement('span');
 +        label.className = 'ff-indicator-label';
@@ -2787,10 +2891,10 @@ index 0000000000000000000000000000000000000000..b5cef2bba40f2c223dbd31f3b36cce04
 +}
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.test.ts b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..bcac83be5f8e4e3c6f96880a73e11ddb22017533
+index 0000000000000000000000000000000000000000..46e6c9c5e93fcc065ffd345c698f2e435616725a
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.test.ts
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,399 @@
 +import { describe, expect, it, vi } from 'vitest';
 +
 +import { TextSubtitlePipeline } from './TextSubtitlePipeline';
@@ -2820,6 +2924,62 @@ index 0000000000000000000000000000000000000000..bcac83be5f8e4e3c6f96880a73e11ddb
 +}
 +
 +describe('TextSubtitlePipeline', () => {
++    it('retries initial activation once and keeps the previous track until recovery', async () => {
++        const pipeline = createPipeline();
++        const previous = createRenderer();
++        await pipeline.select(0, 1, async () => previous);
++        const failed = createRenderer();
++        failed.activate.mockRejectedValue(new Error('first frame timed out'));
++        const recovered = createRenderer();
++        const activation = deferred<void>();
++        recovered.activate.mockReturnValue(activation.promise);
++        const factory = vi.fn().mockResolvedValueOnce(failed).mockResolvedValueOnce(recovered);
++        const selection = pipeline.select(0, 2, factory);
++        await vi.waitFor(() => expect(recovered.activate).toHaveBeenCalledOnce());
++        expect(failed.dispose).toHaveBeenCalledOnce();
++        expect(previous.dispose).not.toHaveBeenCalled();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(1);
++        activation.resolve();
++        await selection;
++        expect(pipeline.getActiveTrackIndex(0)).toBe(2);
++        expect(previous.dispose).toHaveBeenCalledOnce();
++        expect(factory).toHaveBeenCalledTimes(2);
++        pipeline.dispose();
++    });
++
++    it('bounds initial activation retries and restores the previous track', async () => {
++        const changes = vi.fn();
++        const pipeline = new TextSubtitlePipeline(document.createElement('video'), { onStateChange: changes });
++        const previous = createRenderer();
++        await pipeline.select(0, 1, async () => previous);
++        const factory = vi.fn(async () => {
++            const renderer = createRenderer();
++            renderer.activate.mockRejectedValue(new Error('worker stopped'));
++            return renderer;
++        });
++        await pipeline.select(0, 2, factory);
++        expect(factory).toHaveBeenCalledTimes(2);
++        expect(pipeline.getActiveTrackIndex(0)).toBe(1);
++        expect(changes).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'failed', restoredTrackIndex: 1 }));
++        pipeline.dispose();
++    });
++
++    it('does not retry activation after the user clears the track', async () => {
++        const pipeline = createPipeline();
++        const renderer = createRenderer();
++        const activation = deferred<void>();
++        renderer.activate.mockReturnValue(activation.promise);
++        const factory = vi.fn(async () => renderer);
++        const selection = pipeline.select(0, 2, factory);
++        await vi.waitFor(() => expect(renderer.activate).toHaveBeenCalledOnce());
++        pipeline.clear();
++        activation.reject(new Error('cancelled'));
++        await selection;
++        expect(factory).toHaveBeenCalledOnce();
++        expect(pipeline.getActiveTrackIndex(0)).toBeUndefined();
++        pipeline.dispose();
++    });
++
 +    it('keeps the active subtitle visible until its replacement is ready', async () => {
 +        const pipeline = createPipeline();
 +        const first = createRenderer();
@@ -3136,10 +3296,10 @@ index 0000000000000000000000000000000000000000..bcac83be5f8e4e3c6f96880a73e11ddb
 +});
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e46c9c095e4ea1dab664479f523cfca11785b71
+index 0000000000000000000000000000000000000000..60fe24b9dde6c25c039a9ae0849118c253a54a43
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,367 @@
 +import { SubtitleClock } from './SubtitleClock';
 +import type {
 +    SubtitleClockSnapshot,
@@ -3313,7 +3473,7 @@ index 0000000000000000000000000000000000000000..1e46c9c095e4ea1dab664479f523cfca
 +        state: SubtitleSlotState,
 +        trackIndex: number,
 +        factory: SubtitleRendererFactory
-+    ) {
++    ): Promise<void> {
 +        state.loading?.cancel();
 +
 +        const generation = Symbol(String(trackIndex));
@@ -3358,6 +3518,7 @@ index 0000000000000000000000000000000000000000..1e46c9c095e4ea1dab664479f523cfca
 +
 +        const promise = Promise.resolve().then(async () => {
 +            let renderer: SubtitleRenderer | undefined;
++            let activating = false;
 +            try {
 +                if (!isCurrent()) return;
 +                renderer = await factory(request);
@@ -3370,6 +3531,7 @@ index 0000000000000000000000000000000000000000..1e46c9c095e4ea1dab664479f523cfca
 +                renderer.setOffset(state.offsetSeconds);
 +                const snapshot = this.clock.snapshot('selection');
 +                state.loading!.renderer = renderer;
++                activating = true;
 +                await renderer.activate(snapshot);
 +                if (preparationError) throw preparationError;
 +
@@ -3393,6 +3555,12 @@ index 0000000000000000000000000000000000000000..1e46c9c095e4ea1dab664479f523cfca
 +                if (!isCurrent()) return;
 +
 +                state.loading = undefined;
++                // Initial frame failures need the same bounded recovery as
++                // active renderers, while preserving any previous subtitle.
++                if (activating && state.runtimeRetries < MAX_RUNTIME_RETRIES) {
++                    state.runtimeRetries++;
++                    return this.prepare(slot, state, trackIndex, factory);
++                }
 +                this.restoreAfterSelectionFailure(slot, state, trackIndex, error);
 +            } finally {
 +                cancellationCallbacks.clear();
@@ -3501,14 +3669,14 @@ index 0000000000000000000000000000000000000000..1e46c9c095e4ea1dab664479f523cfca
 +}
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..4a0ce64593d265f5229d4fc6a93bd72cc0c958ac
+index 0000000000000000000000000000000000000000..2f35348685139ee0805200199487fda3cb8e2abc
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,355 @@
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +
 +import { TextSubtitlePipeline } from '../TextSubtitlePipeline';
-+import type { SubtitleLoadRequest, SubtitleRenderer } from '../types';
++import type { SubtitleClockReason, SubtitleLoadRequest, SubtitleRenderer } from '../types';
 +import { computeAssRenderSize, createAssRendererAdapter } from './AssRendererAdapter';
 +
 +interface MockOptions extends Record<string, unknown> {
@@ -3615,7 +3783,7 @@ index 0000000000000000000000000000000000000000..4a0ce64593d265f5229d4fc6a93bd72c
 +    };
 +}
 +
-+const snapshot = (currentTime: number, reason: 'selection' | 'frame' | 'seeking' | 'seeked' | 'loadedmetadata' = 'frame') => (
++const snapshot = (currentTime: number, reason: SubtitleClockReason = 'frame') => (
 +    { currentTime, paused: false, playbackRate: 1, reason }
 +);
 +
@@ -3718,12 +3886,43 @@ index 0000000000000000000000000000000000000000..4a0ce64593d265f5229d4fc6a93bd72c
 +        expect(octopus.worker.messages.filter(m => m.target === 'oneshot-render')).toHaveLength(2);
 +    });
 +
-+    it('refreshes a stale first frame to the latest playback time', async () => {
-+        const { renderer, octopus } = await loadRenderer();
++    it('shows a delayed first frame at 2x and immediately requests the latest time', async () => {
++        const { renderer, octopus, parent } = await loadRenderer();
 +        const activation = renderer.activate(snapshot(1, 'selection'));
-+        renderer.update(snapshot(10));
++        renderer.update({ ...snapshot(1.4, 'ratechange'), playbackRate: 2 });
 +        octopus.worker.frame();
-+        expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(12);
++        await activation;
++        expect(parent.querySelector<HTMLElement>('.subtitle-pipeline-ass')?.style.visibility).toBe('visible');
++        expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(3.4);
++        octopus.worker.frame();
++    });
++
++    it.each([ 'ratechange', 'waiting', 'playing', 'pause', 'canplay', 'loadeddata', 'stalled', 'waitingforkey' ] as const)(
++        'preserves visible and in-flight frames across %s', async reason => {
++            const { renderer, octopus } = await loadRenderer();
++            const activation = renderer.activate(snapshot(1, 'selection'));
++            octopus.worker.frame();
++            await activation;
++            renderer.update(snapshot(1.1));
++            const pending = octopus.worker.messages.at(-1);
++            clearRect.mockClear();
++            renderer.update(snapshot(1.2, reason));
++            expect(clearRect).not.toHaveBeenCalled();
++            octopus.worker.frame(pending);
++            expect(clearRect).toHaveBeenCalledOnce();
++            expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(3.2);
++        }
++    );
++
++    it('discards pre-offset frames even during initial activation', async () => {
++        const { renderer, octopus, parent } = await loadRenderer();
++        const activation = renderer.activate(snapshot(1, 'selection'));
++        const pending = octopus.worker.messages.at(-1);
++        renderer.setOffset(4);
++        renderer.update(snapshot(1, 'manual'));
++        octopus.worker.frame(pending);
++        expect(parent.querySelector<HTMLElement>('.subtitle-pipeline-ass')?.style.visibility).toBe('hidden');
++        expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(7);
 +        octopus.worker.frame();
 +        await activation;
 +    });
@@ -3816,13 +4015,13 @@ index 0000000000000000000000000000000000000000..4a0ce64593d265f5229d4fc6a93bd72c
 +        await rejection;
 +    });
 +
-+    it('bounds activation even when a slow worker keeps returning obsolete frames', async () => {
++    it('bounds activation when repeated seeks keep invalidating worker frames', async () => {
 +        vi.useFakeTimers();
 +        const { renderer, octopus } = await loadRenderer();
 +        const rejection = expect(renderer.activate(snapshot(0, 'selection'))).rejects.toThrow('within 10 seconds');
 +        for (let time = 1; time <= 9; time++) {
 +            await vi.advanceTimersByTimeAsync(1_000);
-+            renderer.update(snapshot(time));
++            renderer.update(snapshot(time, 'seeking'));
 +            octopus.worker.frame();
 +        }
 +        await vi.advanceTimersByTimeAsync(1_000);
@@ -3831,10 +4030,10 @@ index 0000000000000000000000000000000000000000..4a0ce64593d265f5229d4fc6a93bd72c
 +});
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..48b189561dff39e480c6a1be6e0dd4e0498ea477
+index 0000000000000000000000000000000000000000..a959f8075d38819571a6263ca7494de3fff16600
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,428 @@
 +import type {
 +    SubtitleClockSnapshot,
 +    SubtitleLoadRequest,
@@ -3969,7 +4168,11 @@ index 0000000000000000000000000000000000000000..48b189561dff39e480c6a1be6e0dd4e0
 +            + this.options.baseTimeOffsetSeconds
 +            + this.offsetSeconds;
 +
-+        if (snapshot.reason !== 'frame') this.invalidate();
++        // Rate/buffering changes preserve the same timeline and visible frame.
++        // Only discontinuities must invalidate an in-flight worker response.
++        if ([ 'selection', 'manual', 'seeking', 'seeked', 'loadstart', 'emptied' ].includes(snapshot.reason)) {
++            this.invalidate();
++        }
 +        this.resize();
 +        this.requestFrame();
 +    }
@@ -4030,9 +4233,10 @@ index 0000000000000000000000000000000000000000..48b189561dff39e480c6a1be6e0dd4e0
 +
 +        try {
 +            const current = pending.epoch === this.epoch;
-+            const fresh = !this.activation
-+                || Math.abs(pending.time - (this.latestTime ?? pending.time)) < 0.25;
-+            if (current && fresh) {
++            // Accept continuous playback even if rendering lags at 2x. A fixed
++            // media-time freshness limit can starve activation indefinitely.
++            // requestFrame below immediately catches up to the latest time.
++            if (current) {
 +                this.paint(event.data);
 +                this.lastRenderedTime = pending.time;
 +                this.host.style.visibility = 'visible';
@@ -4658,10 +4862,10 @@ index 0000000000000000000000000000000000000000..8cf4a5521257a0b254b13ca7d473ee2f
 +    Text?: string | null;
 +}
 diff --git a/src/styles/videoosd.scss b/src/styles/videoosd.scss
-index 8b3de7c5313becb7017ddcb27d21d8f9ee8754c7..1ba6a1fa0a2261def2302fd4ca40cca856e07f2c 100644
+index 8b3de7c5313becb7017ddcb27d21d8f9ee8754c7..dca96f3de205111809d1c82b2d05dcb55ea4c175 100644
 --- a/src/styles/videoosd.scss
 +++ b/src/styles/videoosd.scss
-@@ -119,6 +119,41 @@
+@@ -119,6 +119,45 @@
      opacity: 0;
  }
  
@@ -4698,6 +4902,10 @@ index 8b3de7c5313becb7017ddcb27d21d8f9ee8754c7..1ba6a1fa0a2261def2302fd4ca40cca8
 +.ff-indicator .material-icons {
 +    margin-right: 0.35em;
 +    font-size: 1.35em;
++}
++
++.ff-indicator-icon::before {
++    content: "\e01f";
 +}
 +
  .osdControls {

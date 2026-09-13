@@ -171,7 +171,7 @@ export class TextSubtitlePipeline {
         state: SubtitleSlotState,
         trackIndex: number,
         factory: SubtitleRendererFactory
-    ) {
+    ): Promise<void> {
         state.loading?.cancel();
 
         const generation = Symbol(String(trackIndex));
@@ -216,6 +216,7 @@ export class TextSubtitlePipeline {
 
         const promise = Promise.resolve().then(async () => {
             let renderer: SubtitleRenderer | undefined;
+            let activating = false;
             try {
                 if (!isCurrent()) return;
                 renderer = await factory(request);
@@ -228,6 +229,7 @@ export class TextSubtitlePipeline {
                 renderer.setOffset(state.offsetSeconds);
                 const snapshot = this.clock.snapshot('selection');
                 state.loading!.renderer = renderer;
+                activating = true;
                 await renderer.activate(snapshot);
                 if (preparationError) throw preparationError;
 
@@ -251,6 +253,12 @@ export class TextSubtitlePipeline {
                 if (!isCurrent()) return;
 
                 state.loading = undefined;
+                // Initial frame failures need the same bounded recovery as
+                // active renderers, while preserving any previous subtitle.
+                if (activating && state.runtimeRetries < MAX_RUNTIME_RETRIES) {
+                    state.runtimeRetries++;
+                    return this.prepare(slot, state, trackIndex, factory);
+                }
                 this.restoreAfterSelectionFailure(slot, state, trackIndex, error);
             } finally {
                 cancellationCallbacks.clear();

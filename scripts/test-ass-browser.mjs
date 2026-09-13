@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
+import ts from 'typescript';
+import { compileString } from 'sass';
 
 // Optional tooling stays outside the production dependency lockfile.
 // PLAYWRIGHT_MODULE can point to an external playwright/index.mjs installation.
@@ -22,6 +24,24 @@ const ffmpeg = spawnSync('ffmpeg', [
     '-t', '60', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', videoFile
 ], { windowsHide: true });
 assert.equal(ffmpeg.status, 0, ffmpeg.stderr?.toString() || 'ffmpeg is required');
+
+// Exercise the actual hold handlers, with only their surrounding OSD services stubbed.
+const controller = ts.createSourceFile('video.js', await readFile(path.join(root,
+    'src/apps/legacy/controllers/playback/video/index.js'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+const holdNames = new Set([
+    'supportsSpeedHold', 'createFastForwardIndicator', 'showFastForwardIndicator',
+    'hideFastForwardIndicator', 'beginSpeedHold', 'finishSpeedHold'
+]);
+const holdFunctions = [];
+function collectHoldFunctions(node) {
+    if (ts.isFunctionDeclaration(node) && holdNames.has(node.name?.text)) holdFunctions.push(node.getText(controller));
+    ts.forEachChild(node, collectHoldFunctions);
+}
+collectHoldFunctions(controller);
+assert.equal(holdFunctions.length, holdNames.size);
+const osdCss = compileString(await readFile(path.join(root, 'src/styles/videoosd.scss'), 'utf8'), {
+    loadPaths: [path.join(root, 'src/styles')]
+}).css;
 
 const bundled = await build({
     absWorkingDir: root,
@@ -46,6 +66,29 @@ import { createAssRendererAdapter } from './src/plugins/htmlVideoPlayer/subtitle
 import { TextSubtitlePipeline } from './src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline';
 import { TextEventRenderer } from './src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer';
 const video = document.querySelector('video');
+const view = video.parentElement;
+const currentPlayer = video;
+let speedHoldSource, speedHoldPointerType, speedHoldPointerId, speedHoldPlayer;
+let speedHoldTimeout, fastForwardIndicatorElem;
+let speedHoldOriginalPlaybackRate = 1;
+let isSpeedHoldMode = false;
+const playbackManager = {
+    getSupportedPlaybackRates: () => [{ id: 1 }, { id: 2 }],
+    getPlaybackRate: player => player.playbackRate,
+    setPlaybackRate: (rate, player) => { player.playbackRate = rate; }
+};
+function hideOsd() {}
+function stopOsdHideTimer() {}
+function resetIdle() {}
+${holdFunctions.join('\n')}
+video.addEventListener('mousedown', () => beginSpeedHold('pointer', 'mouse', 1));
+window.addEventListener('mouseup', () => finishSpeedHold('pointer'));
+const postMessage = Worker.prototype.postMessage;
+Worker.prototype.postMessage = function(message, ...rest) {
+    if (message.target === 'oneshot-render' && window.renderDelay) {
+        setTimeout(() => postMessage.call(this, message, ...rest), window.renderDelay);
+    } else postMessage.call(this, message, ...rest);
+};
 const changes = [];
 let pipeline;
 function reset() {
@@ -76,6 +119,7 @@ window.fixture = {
     clear: () => pipeline.clear(),
     active: () => pipeline.getActiveTrackIndex(0),
     renderer: () => pipeline.slots.get(0)?.active?.renderer,
+    loadingRenderer: () => pipeline.slots.get(0)?.loading?.renderer,
     pixels: () => {
         const canvas = document.querySelector('.subtitle-pipeline-ass canvas');
         if (!canvas) return 0;
@@ -124,7 +168,10 @@ const server = createServer(async (req, res) => {
         res.setHeader('Cache-Control', 'no-store');
         if (url.pathname === '/') {
             res.setHeader('Content-Type', 'text/html');
-            res.end('<!doctype html><div style="position:relative;width:640px;height:360px"><video muted playsinline src="/fixture.mp4" style="width:100%;height:100%"></video></div><script src="/test.js"></script>');
+            res.end('<!doctype html><link rel="stylesheet" href="/test.css"><div style="position:relative;width:640px;height:360px"><video muted playsinline src="/fixture.mp4" style="width:100%;height:100%"></video></div><script src="/test.js"></script>');
+        } else if (url.pathname === '/test.css') {
+            res.setHeader('Content-Type', 'text/css');
+            res.end(osdCss + '\n.material-icons.fast_forward::before { content: "\\e057"; }');
         } else if (url.pathname === '/test.js') {
             res.setHeader('Content-Type', 'text/javascript');
             res.end(bundled.outputFiles[0].contents);
@@ -154,6 +201,37 @@ try {
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
+    for (const legacy of [false, true]) {
+        for (const releaseEarly of [false, true]) {
+            await page.goto(`http://127.0.0.1:${server.address().port}`);
+            await page.waitForFunction(() => window.fixture?.video.readyState >= 2);
+            await page.mouse.move(200, 200);
+            await page.evaluate(legacyWorker => {
+                window.renderDelay = 200;
+                window.seekCount = 0;
+                window.fixture.video.addEventListener('seeking', () => window.seekCount++);
+                window.fixture.video.play();
+                window.initialSelection = window.fixture.select(true, legacyWorker);
+            }, legacy);
+            await page.mouse.down();
+            await page.waitForFunction(() => window.fixture.video.playbackRate === 2);
+            const icon = await page.locator('.ff-indicator .material-icons').evaluate(element => ({
+                className: element.className,
+                content: getComputedStyle(element, '::before').content
+            }));
+            assert.ok(!icon.className.split(' ').includes('fast_forward'));
+            assert.ok(icon.content.includes('\ue01f'), 'Scyfin must not replace the hold icon with forward_30');
+            if (releaseEarly) await page.mouse.up();
+            await page.evaluate(() => window.initialSelection);
+            assert.equal(await page.evaluate(() => window.fixture.active()), 2);
+            assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0, 'delayed first ASS frame must appear at 2x');
+            if (!releaseEarly) await page.mouse.up();
+            await page.waitForFunction(() => window.fixture.video.playbackRate === 1);
+            assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0, 'releasing hold must preserve subtitles');
+            assert.equal(await page.evaluate(() => window.seekCount), 0);
+            console.log(`PASS: startup mouse hold/release, slow fonts and 200ms frames (${legacy ? 'legacy' : 'WASM'}, release ${releaseEarly ? 'before' : 'after'} first frame), Scyfin icon isolation`);
+        }
+    }
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     await page.waitForFunction(() => window.fixture?.video.readyState >= 2);
     await page.evaluate(() => window.fixture.video.play());
@@ -162,14 +240,40 @@ try {
     assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0, 'slow initial ASS must render without seeking');
     console.log('PASS: delayed ASS and font loading, initial playback without seek');
 
+    await page.evaluate(() => {
+        window.fixture.clear();
+        window.renderDelay = 200;
+        window.initialRecovery = window.fixture.select();
+    });
+    await page.waitForFunction(() => window.fixture.loadingRenderer()?.pending);
+    await page.evaluate(() => {
+        window.failedInitialRenderer = window.fixture.loadingRenderer();
+        window.failedInitialRenderer.worker.terminate();
+    });
+    await page.evaluate(() => window.initialRecovery);
+    assert.equal(await page.evaluate(() => window.fixture.active()), 2);
+    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
+    assert.ok(await page.evaluate(() => window.fixture.renderer() !== window.failedInitialRenderer));
+    assert.equal(await page.locator('.subtitle-pipeline-ass').count(), 1);
+    console.log('PASS: a worker stopped before its first frame is recreated without seeking');
+
     await page.evaluate(() => window.fixture.text());
     await page.evaluate(() => {
         window.switching = window.fixture.select(true);
     });
     assert.equal(await page.evaluate(() => window.fixture.active()), 1);
+    await page.mouse.move(200, 200);
+    await page.mouse.down();
+    await page.waitForFunction(() => window.fixture.video.playbackRate === 2);
     await page.evaluate(() => window.switching);
     assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
-    console.log('PASS: delayed SRT to ASS keeps the previous track until rendering completes');
+    await page.mouse.up();
+    await page.waitForFunction(() => window.fixture.video.playbackRate === 1);
+    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
+    await page.evaluate(() => {
+        window.renderDelay = 0;
+    });
+    console.log('PASS: delayed SRT to ASS during mouse hold keeps the previous track until rendering completes');
 
     await page.evaluate(() => {
         window.fixture.video.pause();

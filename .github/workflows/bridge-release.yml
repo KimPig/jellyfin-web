@@ -121,7 +121,7 @@ jobs:
         working-directory: upstream-web
         run: npm run build:production
 
-      - name: Publish patched source branch and release
+      - name: Publish patched source tag and release
         if: steps.upstream.outputs.publish == 'true'
         env:
           UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
@@ -129,7 +129,6 @@ jobs:
           RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
         run: |
           set -euo pipefail
-          branch="enhancements/${UPSTREAM_TAG}-patch-${PATCH_VERSION}"
           asset_base="jellyfin-web-${RELEASE_TAG}-dist"
           git -C upstream-web config user.name 'github-actions[bot]'
           git -C upstream-web config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -155,7 +154,7 @@ jobs:
           git -C upstream-web commit -m "feat: apply Web enhancements to $UPSTREAM_TAG"
           git -C upstream-web tag -a "$RELEASE_TAG" -m "Patched Jellyfin Web build $PATCH_VERSION for $UPSTREAM_TAG"
           git -C upstream-web remote add target "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git -C upstream-web push --force target "HEAD:refs/heads/$branch" "refs/tags/$RELEASE_TAG"
+          git -C upstream-web push target "refs/tags/$RELEASE_TAG"
           (
             cd upstream-web
             zip -qr "../${asset_base}.zip" dist
@@ -169,7 +168,6 @@ jobs:
             "${asset_base}.zip" \
             "${asset_base}.zip.sha256" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$branch" \
             "${release_flags[@]}" \
             --title "Jellyfin Web $RELEASE_TAG" \
             --notes "Automated patch build $PATCH_VERSION based on official Jellyfin Web $UPSTREAM_TAG. The release ZIP contains the validated production dist assets."

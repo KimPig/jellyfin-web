@@ -33,7 +33,7 @@ daily and can also be started manually. For each unprocessed upstream tag it:
 2. applies the complete compatibility patch with `git apply --3way`;
 3. runs TypeScript checks, every custom subtitle test, the Bridge resolver
    tests, and ESLint on the integration files;
-4. builds production `dist` assets;
+4. builds production `dist` assets and checks their JavaScript syntax compatibility;
 5. pushes an `<upstream-tag>.patch.<YYYYMMDD.N>` tag containing the patched
    source, without creating a release branch; and
 6. creates a GitHub Release containing
@@ -58,6 +58,8 @@ latest timestamp, avoiding activation starvation at 2x. First-frame failures
 share the bounded retry budget with runtime failures, retaining the previous
 track during recovery. The hold indicator uses a dedicated icon class so themes
 that replace `fast_forward` with a skip icon do not affect it.
+Up Next sizing uses the existing ResizeObserver polyfill. Plugin discovery
+excludes test modules so the production bundle does not include Vitest.
 
 `scripts/test-ass-browser.mjs` exercises the real WASM and legacy workers in
 headless Chromium with delayed ASS/font responses. It checks canvas pixels

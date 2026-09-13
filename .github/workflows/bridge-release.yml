@@ -102,6 +102,7 @@ jobs:
             src/utils/subtitleFontBridgeResolver.test.ts
           npx eslint \
             src/components/playback/skipsegment.ts \
+            src/components/pluginManager.js \
             src/plugins/htmlVideoPlayer/plugin.js \
             src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts \
             "src/plugins/htmlVideoPlayer/subtitles/**/*.ts" \
@@ -120,7 +121,9 @@ jobs:
       - name: Build production Web assets
         if: steps.upstream.outputs.publish == 'true'
         working-directory: upstream-web
-        run: npm run build:production
+        run: |
+          npm run build:production
+          npm run escheck
 
       - name: Publish patched source tag and release
         if: steps.upstream.outputs.publish == 'true'
@@ -138,6 +141,7 @@ jobs:
             src/apps/legacy/controllers/playback/video/index.js \
             src/components/playback/skipbutton.scss \
             src/components/playback/skipsegment.ts \
+            src/components/pluginManager.js \
             src/plugins/htmlVideoPlayer/plugin.js \
             src/plugins/htmlVideoPlayer/style.scss \
             src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts \

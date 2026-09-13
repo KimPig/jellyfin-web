@@ -893,6 +893,23 @@ index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..02c3fc61d5cf1338cbfd9fe253400561
          }
      }
  
+diff --git a/src/components/pluginManager.js b/src/components/pluginManager.js
+index 7f9d57dd1b2d4e7647515bf1f08a3039e1c13cf8..a696e3e3830c4d9a9fa05520efd66ca0dacd377a 100644
+--- a/src/components/pluginManager.js
++++ b/src/components/pluginManager.js
+@@ -94,7 +94,11 @@ class PluginManager {
+                 });
+             } else {
+                 console.debug(`Loading plugin (via dynamic import): ${pluginSpec}`);
+-                const pluginResult = await import(/* webpackChunkName: "[request]" */ `../plugins/${pluginSpec}`);
++                const pluginResult = await import(
++                    /* webpackChunkName: "[request]" */
++                    /* webpackExclude: /\.(test|spec)\.[jt]sx?$/ */
++                    `../plugins/${pluginSpec}`
++                );
+                 plugin = new pluginResult.default;
+             }
+         } else if (pluginSpec.then) {
 diff --git a/src/plugins/htmlVideoPlayer/plugin.js b/src/plugins/htmlVideoPlayer/plugin.js
 index 4a5951b47b3f6088d867681c0bd4415cd78a268c..81a57331f9fbbed5259de0e02d1cb1cd665ec50f 100644
 --- a/src/plugins/htmlVideoPlayer/plugin.js

@@ -17,6 +17,7 @@ const enhancementPaths = [
     'src/apps/legacy/controllers/playback/video/index.js',
     'src/components/playback/skipbutton.scss',
     'src/components/playback/skipsegment.ts',
+    'src/components/pluginManager.js',
     'src/plugins/htmlVideoPlayer/plugin.js',
     'src/plugins/htmlVideoPlayer/style.scss',
     'src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts',

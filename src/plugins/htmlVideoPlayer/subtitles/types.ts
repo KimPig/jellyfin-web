@@ -29,7 +29,7 @@ export interface SubtitleClockSnapshot {
 }
 
 export interface SubtitleRenderer {
-    activate(snapshot: SubtitleClockSnapshot): void;
+    activate(snapshot: SubtitleClockSnapshot): void | Promise<void>;
     update(snapshot: SubtitleClockSnapshot): void;
     setOffset(offsetSeconds: number): void;
     dispose(): void;

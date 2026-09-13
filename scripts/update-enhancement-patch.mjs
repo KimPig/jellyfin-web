@@ -13,6 +13,7 @@ const outputFile = path.join(patchesDirectory, 'jellyfin-web-enhancements.patch'
 // list explicit prevents documentation, automation, or local-only files from
 // accidentally becoming part of the compatibility patch.
 const enhancementPaths = [
+    'scripts/test-ass-browser.mjs',
     'src/apps/legacy/controllers/playback/video/index.js',
     'src/components/playback/skipbutton.scss',
     'src/components/playback/skipsegment.ts',

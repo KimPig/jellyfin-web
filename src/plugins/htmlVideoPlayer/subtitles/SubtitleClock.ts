@@ -38,11 +38,13 @@ export class SubtitleClock {
     readonly listeners = new Set<SubtitleClockListener>();
     disposed = false;
     buffering = false;
+    lastObservedTime: number;
     videoFrameHandle?: number;
     animationFrameHandle?: number;
 
     constructor(videoElement: HTMLVideoElement) {
         this.videoElement = videoElement;
+        this.lastObservedTime = videoElement.currentTime;
 
         for (const eventName of VIDEO_EVENTS) {
             videoElement.addEventListener(eventName, this.onVideoEvent);
@@ -89,6 +91,7 @@ export class SubtitleClock {
 
     onVideoEvent = (event: Event) => {
         const reason = event.type as SubtitleClockReason;
+        this.lastObservedTime = this.videoElement.currentTime;
         if (
             reason === 'loadstart'
             || reason === 'emptied'
@@ -113,12 +116,14 @@ export class SubtitleClock {
     onTimeUpdate = () => {
         // timeupdate is a fallback heartbeat for browsers and WebViews that
         // do not reliably deliver video-frame callbacks.
+        this.observeProgress();
         this.pulse('frame');
         this.scheduleFrame();
     };
 
     onVideoFrame: VideoFrameRequestCallback = () => {
         this.videoFrameHandle = undefined;
+        this.observeProgress();
         this.pulse('frame');
         this.scheduleFrame();
     };
@@ -130,6 +135,21 @@ export class SubtitleClock {
         }
         this.scheduleFrame();
     };
+
+    observeProgress() {
+        const video = this.videoElement;
+        if (
+            this.buffering
+            && !video.paused
+            && !video.seeking
+            && !video.ended
+            && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+            && video.currentTime > this.lastObservedTime
+        ) {
+            this.buffering = false;
+        }
+        this.lastObservedTime = video.currentTime;
+    }
 
     cancelScheduledFrame() {
         if (this.videoFrameHandle !== undefined) {

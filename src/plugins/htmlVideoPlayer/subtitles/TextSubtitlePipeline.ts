@@ -20,6 +20,7 @@ interface LoadingRendererState {
     trackIndex: number;
     cancel(): void;
     promise: Promise<void>;
+    renderer?: SubtitleRenderer;
 }
 
 interface SubtitleSlotState {
@@ -94,6 +95,16 @@ export class TextSubtitlePipeline {
     setOffset(slot: SubtitleSlot, offsetSeconds: number) {
         const state = this.getOrCreateSlot(slot);
         state.offsetSeconds = offsetSeconds;
+
+        if (state.loading?.renderer) {
+            try {
+                state.loading.renderer.setOffset(offsetSeconds);
+                state.loading.renderer.update(this.clock.snapshot('manual'));
+            } catch (error) {
+                this.safeDispose(state.loading.renderer);
+                console.debug('Unable to offset preparing subtitle renderer', error);
+            }
+        }
 
         if (!state.active) return;
         try {
@@ -216,8 +227,8 @@ export class TextSubtitlePipeline {
 
                 renderer.setOffset(state.offsetSeconds);
                 const snapshot = this.clock.snapshot('selection');
-                renderer.activate(snapshot);
-                renderer.update(snapshot);
+                state.loading!.renderer = renderer;
+                await renderer.activate(snapshot);
                 if (preparationError) throw preparationError;
 
                 if (!isCurrent()) {
@@ -326,6 +337,15 @@ export class TextSubtitlePipeline {
 
     onClock = (snapshot: SubtitleClockSnapshot) => {
         for (const [ slot, state ] of this.slots) {
+            const loading = state.loading;
+            if (loading?.renderer) {
+                try {
+                    loading.renderer.update(snapshot);
+                } catch (error) {
+                    this.safeDispose(loading.renderer);
+                    console.debug('Unable to update preparing subtitle renderer', error);
+                }
+            }
             const active = state.active;
             if (!active) continue;
 

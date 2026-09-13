@@ -106,6 +106,16 @@ jobs:
             "src/plugins/htmlVideoPlayer/subtitles/**/*.ts" \
             src/utils/subtitleFontBridgeResolver.test.ts
 
+      - name: Verify real ASS worker rendering
+        if: steps.upstream.outputs.publish == 'true'
+        working-directory: upstream-web
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/ass-browser-tools" --no-save --no-package-lock playwright@1.63.0
+          node "$RUNNER_TEMP/ass-browser-tools/node_modules/playwright/cli.js" install --with-deps chromium
+          command -v ffmpeg >/dev/null || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          PLAYWRIGHT_MODULE="$RUNNER_TEMP/ass-browser-tools/node_modules/playwright/index.mjs" node scripts/test-ass-browser.mjs
+
       - name: Build production Web assets
         if: steps.upstream.outputs.publish == 'true'
         working-directory: upstream-web
@@ -124,6 +134,7 @@ jobs:
           git -C upstream-web config user.name 'github-actions[bot]'
           git -C upstream-web config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git -C upstream-web add -A -- \
+            scripts/test-ass-browser.mjs \
             src/apps/legacy/controllers/playback/video/index.js \
             src/components/playback/skipbutton.scss \
             src/components/playback/skipsegment.ts \

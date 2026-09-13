@@ -1,5 +1,300 @@
+diff --git a/scripts/test-ass-browser.mjs b/scripts/test-ass-browser.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..12509656e083adb2228853df7ef39f933091f97c
+--- /dev/null
++++ b/scripts/test-ass-browser.mjs
+@@ -0,0 +1,289 @@
++/* eslint-disable compat/compat -- Developer test runs in Node 24 and current Chromium. */
++import assert from 'node:assert/strict';
++import { spawnSync } from 'node:child_process';
++import { createServer } from 'node:http';
++import { mkdtemp, readFile, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { fileURLToPath, pathToFileURL } from 'node:url';
++import { build } from 'esbuild';
++
++// Optional tooling stays outside the production dependency lockfile.
++// PLAYWRIGHT_MODULE can point to an external playwright/index.mjs installation.
++const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?
++    pathToFileURL(path.resolve(process.env.PLAYWRIGHT_MODULE)).href : 'playwright');
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
++const temporary = await mkdtemp(path.join(tmpdir(), 'jellyfin-ass-test-'));
++const videoFile = path.join(temporary, 'fixture.mp4');
++// Developer tooling uses the caller's trusted PATH, just like the patch generator.
++// eslint-disable-next-line sonarjs/no-os-command-from-path
++const ffmpeg = spawnSync('ffmpeg', [
++    '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=24',
++    '-t', '60', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', videoFile
++], { windowsHide: true });
++assert.equal(ffmpeg.status, 0, ffmpeg.stderr?.toString() || 'ffmpeg is required');
++
++const bundled = await build({
++    absWorkingDir: root,
++    plugins: process.env.ASS_SOURCE_REF ? [{
++        name: 'subtitle-revision',
++        setup(builder) {
++            builder.onLoad({ filter: /[\\/]subtitles[\\/].*\.ts$/ }, ({ path: sourcePath }) => {
++                const relative = path.relative(root, sourcePath).split(path.sep).join('/');
++                // eslint-disable-next-line sonarjs/no-os-command-from-path
++                const result = spawnSync('git', ['show', `${process.env.ASS_SOURCE_REF}:${relative}`], {
++                    cwd: root, encoding: 'utf8', windowsHide: true
++                });
++                assert.equal(result.status, 0, result.stderr);
++                return { contents: result.stdout, loader: 'ts' };
++            });
++        }
++    }] : [],
++    stdin: {
++        resolveDir: root,
++        contents: `
++import { createAssRendererAdapter } from './src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter';
++import { TextSubtitlePipeline } from './src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline';
++import { TextEventRenderer } from './src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer';
++const video = document.querySelector('video');
++const changes = [];
++let pipeline;
++function reset() {
++    pipeline?.dispose();
++    pipeline = new TextSubtitlePipeline(video, { onStateChange: change => changes.push(change) });
++}
++reset();
++const factory = (request, slow, legacy, badFont) => createAssRendererAdapter({
++    videoElement: video,
++    subtitleUrl: location.origin + (slow ? '/slow.ass' : '/subtitle.ass'),
++    fonts: [location.origin + (badFont ? '/bad-font' : slow ? '/slow-font.woff2' : '/font.woff2')],
++    fallbackFonts: [location.origin + '/font.woff2'],
++    workerUrl: location.origin + '/lib/subtitles-octopus-worker' + (legacy ? '-legacy' : '') + '.js',
++    legacyWorkerUrl: location.origin + '/lib/subtitles-octopus-worker-legacy.js',
++    baseTimeOffsetSeconds: 0,
++    targetFps: 24,
++    request
++});
++window.fixture = {
++    video, changes, reset,
++    select: (slow = false, legacy = false, badFont = false, slot = 0) =>
++        pipeline.select(slot, 2, request => factory(request, slow, legacy, badFont)),
++    text: () => pipeline.select(0, 1, async () => new TextEventRenderer({
++        parentElement: video.parentElement, slot: 0,
++        trackEvents: [{ StartPositionTicks: 0, EndPositionTicks: 600000000, Text: 'SRT fixture' }],
++        baseTimeOffsetSeconds: 0, secondaryBeforePrimary: false, applyAppearance: () => {}
++    })),
++    clear: () => pipeline.clear(),
++    active: () => pipeline.getActiveTrackIndex(0),
++    renderer: () => pipeline.slots.get(0)?.active?.renderer,
++    pixels: () => {
++        const canvas = document.querySelector('.subtitle-pipeline-ass canvas');
++        if (!canvas) return 0;
++        const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
++        let count = 0;
++        for (let i = 3; i < data.length; i += 4) if (data[i]) count++;
++        return count;
++    }
++};`
++    },
++    bundle: true, write: false, format: 'iife', platform: 'browser', target: 'chrome100'
++});
++
++const subtitle = `[Script Info]
++ScriptType: v4.00+
++PlayResX: 640
++PlayResY: 360
++[V4+ Styles]
++Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
++Style: Default,Liberation Sans,32,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,20,1
++[Events]
++Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
++Dialogue: 0,0:00:00.00,0:00:20.00,Default,,0,0,0,,ASS READY
++Dialogue: 0,0:00:30.00,0:01:00.00,Default,,0,0,0,,{\\move(80,80,400,80)}ANIMATED
++`;
++const library = path.join(root, 'node_modules/@jellyfin/libass-wasm/dist/js');
++const requests = [];
++async function serveVideo(req, res) {
++    const data = await readFile(videoFile);
++    const range = req.headers.range?.match(/^bytes=(\d+)-(\d*)$/u);
++    res.setHeader('Content-Type', 'video/mp4');
++    res.setHeader('Accept-Ranges', 'bytes');
++    if (range) {
++        const start = Number(range[1]);
++        const end = range[2] ? Number(range[2]) : data.length - 1;
++        res.writeHead(206, { 'Content-Range': `bytes ${start}-${end}/${data.length}`, 'Content-Length': end - start + 1 });
++        res.end(data.subarray(start, end + 1));
++    } else { res.end(data); }
++}
++
++const server = createServer(async (req, res) => {
++    const url = new URL(req.url, 'http://localhost');
++    requests.push(url.pathname);
++    try {
++        if (url.pathname.startsWith('/slow')) await new Promise(resolve => setTimeout(resolve, 1_500));
++        res.setHeader('Cache-Control', 'no-store');
++        if (url.pathname === '/') {
++            res.setHeader('Content-Type', 'text/html');
++            res.end('<!doctype html><div style="position:relative;width:640px;height:360px"><video muted playsinline src="/fixture.mp4" style="width:100%;height:100%"></video></div><script src="/test.js"></script>');
++        } else if (url.pathname === '/test.js') {
++            res.setHeader('Content-Type', 'text/javascript');
++            res.end(bundled.outputFiles[0].contents);
++        } else if (url.pathname.endsWith('.ass')) {
++            res.end(subtitle);
++        } else if (url.pathname === '/bad-font') {
++            res.writeHead(500).end('font unavailable');
++        } else if (url.pathname.endsWith('.woff2')) {
++            res.end(await readFile(path.join(library, 'default.woff2')));
++        } else if (url.pathname === '/fixture.mp4') {
++            await serveVideo(req, res);
++        } else if (/^\/lib\/subtitles-octopus-worker(?:-legacy)?\.(?:js|wasm)$/u.test(url.pathname)) {
++            res.setHeader('Content-Type', url.pathname.endsWith('.wasm') ? 'application/wasm' : 'text/javascript');
++            res.end(await readFile(path.join(library, path.basename(url.pathname))));
++        } else { res.writeHead(404).end(); }
++    } catch (error) {
++        res.writeHead(500).end(String(error));
++    }
++});
++await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
++let browser;
++try {
++    browser = await chromium.launch({
++        headless: true,
++        executablePath: process.env.CHROMIUM_EXECUTABLE || undefined
++    });
++    const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
++    const errors = [];
++    page.on('pageerror', error => errors.push(error.message));
++    await page.goto(`http://127.0.0.1:${server.address().port}`);
++    await page.waitForFunction(() => window.fixture?.video.readyState >= 2);
++    await page.evaluate(() => window.fixture.video.play());
++    await page.evaluate(() => window.fixture.select(true));
++    assert.equal(await page.evaluate(() => window.fixture.active()), 2);
++    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0, 'slow initial ASS must render without seeking');
++    console.log('PASS: delayed ASS and font loading, initial playback without seek');
++
++    await page.evaluate(() => window.fixture.text());
++    await page.evaluate(() => {
++        window.switching = window.fixture.select(true);
++    });
++    assert.equal(await page.evaluate(() => window.fixture.active()), 1);
++    await page.evaluate(() => window.switching);
++    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
++    console.log('PASS: delayed SRT to ASS keeps the previous track until rendering completes');
++
++    await page.evaluate(() => {
++        window.fixture.video.pause();
++        window.fixture.video.currentTime = 8;
++    });
++    await page.waitForFunction(() => !window.fixture.video.seeking && window.fixture.pixels() > 0);
++    const first = await page.evaluate(() => window.fixture.pixels());
++    await page.evaluate(() => {
++        window.fixture.video.currentTime = 9;
++    });
++    await page.waitForFunction(() => !window.fixture.video.seeking && window.fixture.pixels() > 0);
++    assert.equal(await page.evaluate(() => window.fixture.pixels()), first);
++    await page.evaluate(() => {
++        window.fixture.video.currentTime = 25;
++    });
++    await page.waitForFunction(() => !window.fixture.video.seeking && window.fixture.pixels() === 0);
++    await page.evaluate(() => {
++        window.fixture.video.currentTime = 0;
++    });
++    await page.waitForFunction(() => !window.fixture.video.seeking && window.fixture.pixels() > 0);
++    console.log('PASS: paused same-cue redraw, empty interval, backward seek to zero');
++
++    for (let i = 0; i < 4; i++) {
++        await page.evaluate(() => window.fixture.text());
++        await page.evaluate(() => window.fixture.select());
++        assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
++    }
++    await page.evaluate(() => {
++        window.fixture.clear();
++    });
++    assert.equal(await page.locator('.subtitle-pipeline-ass').count(), 0);
++    await page.evaluate(() => window.fixture.select());
++    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
++    console.log('PASS: repeated switching and off/on');
++
++    await page.evaluate(() => {
++        window.fixture.clear();
++        window.cancelled = window.fixture.select(true);
++    });
++    await page.evaluate(() => window.fixture.clear());
++    await page.evaluate(() => window.cancelled);
++    assert.equal(await page.locator('.subtitle-pipeline-ass').count(), 0);
++    await page.evaluate(() => window.fixture.select());
++    console.log('PASS: cancelled slow load cannot restore an obsolete track');
++
++    await page.evaluate(() => {
++        window.retiredRenderer = window.fixture.renderer();
++        window.retiredRenderer.worker.terminate();
++        return window.fixture.video.play();
++    });
++    await page.waitForFunction(() => (
++        window.fixture.renderer()
++        && window.fixture.renderer() !== window.retiredRenderer
++        && window.fixture.pixels() > 0
++    ), undefined, { timeout: 15_000 });
++    assert.equal(await page.locator('.subtitle-pipeline-ass').count(), 1);
++    console.log('PASS: a silently stopped worker is recreated without a user seek');
++    await page.evaluate(() => window.fixture.video.pause());
++
++    await page.evaluate(() => window.fixture.select(false, false, false, 1));
++    assert.equal(await page.locator('.subtitle-pipeline-ass').count(), 2);
++    await page.setViewportSize({ width: 390, height: 844 });
++    await page.evaluate(() => {
++        window.fixture.video.parentElement.style.width = '360px';
++        window.fixture.video.parentElement.style.height = '202px';
++    });
++    await page.waitForFunction(() => {
++        const width = document.querySelector('.subtitle-pipeline-ass canvas').width;
++        return width > 0 && width <= 360 && window.fixture.pixels() > 0;
++    });
++    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0);
++    console.log('PASS: two subtitle slots and mobile-size resize');
++
++    await page.evaluate(() => {
++        window.fixture.video.currentTime = 32;
++        window.fixture.video.playbackRate = 2;
++    });
++    await page.waitForFunction(() => !window.fixture.video.seeking && window.fixture.pixels() > 0);
++    const centroid = () => {
++        const canvas = document.querySelector('.subtitle-pipeline-ass canvas');
++        const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
++        let sum = 0;
++        let count = 0;
++        for (let i = 3; i < data.length; i += 4) {
++            if (data[i]) {
++                sum += ((i - 3) / 4) % canvas.width;
++                count++;
++            }
++        }
++        return sum / count;
++    };
++    const beforeAnimation = await page.evaluate(centroid);
++    await page.evaluate(() => window.fixture.video.play());
++    await page.waitForFunction(() => window.fixture.renderer().lastRenderedTime >= 34);
++    await page.evaluate(() => window.fixture.video.pause());
++    assert.ok(await page.evaluate(centroid) > beforeAnimation, 'ASS animation must advance at 2x playback');
++    console.log('PASS: animated ASS follows 2x playback');
++
++    await page.evaluate(() => {
++        window.fixture.reset();
++        window.fixture.video.currentTime = 0;
++    });
++    await page.evaluate(() => window.fixture.select(false, true));
++    assert.ok(await page.evaluate(() => window.fixture.pixels()) > 0, 'legacy worker must also render');
++    console.log('PASS: legacy libass worker');
++
++    assert.deepEqual(errors, []);
++    assert.ok(requests.includes('/slow.ass') && requests.includes('/slow-font.woff2'));
++    console.log('ASS browser checks passed; no screenshots captured.');
++} finally {
++    await browser?.close();
++    await new Promise(resolve => server.close(resolve));
++    assert.equal(path.dirname(path.resolve(temporary)), path.resolve(tmpdir()));
++    assert.ok(path.basename(temporary).startsWith('jellyfin-ass-test-'));
++    await rm(temporary, { recursive: true, force: true });
++}
++/* eslint-enable compat/compat */
 diff --git a/src/apps/legacy/controllers/playback/video/index.js b/src/apps/legacy/controllers/playback/video/index.js
-index fdde2c558253161aeae75afe34fe46056d2ed5ae..b5e81df4e512ca697bd4bad08ea14ac558b64172 100644
+index add9be8143a54cbafcebd1cf6997a927f213888d..ab1508286cc5503a0e3ebd35a13ce1b2c4a72a3a 100644
 --- a/src/apps/legacy/controllers/playback/video/index.js
 +++ b/src/apps/legacy/controllers/playback/video/index.js
 @@ -268,8 +268,19 @@ export default function (view) {
@@ -232,7 +527,7 @@ index fdde2c558253161aeae75afe34fe46056d2ed5ae..b5e81df4e512ca697bd4bad08ea14ac5
          resetIdle();
      }
  
-@@ -1674,6 +1838,8 @@ export default function (view) {
+@@ -1676,6 +1840,8 @@ export default function (view) {
              showOsd();
              inputManager.on(window, onInputCommand);
              document.addEventListener('keydown', onKeyDown);
@@ -241,7 +536,7 @@ index fdde2c558253161aeae75afe34fe46056d2ed5ae..b5e81df4e512ca697bd4bad08ea14ac5
              dom.addEventListener(document, 'keydown', onKeyDownCapture, {
                  capture: true,
                  passive: true
-@@ -1689,7 +1855,13 @@ export default function (view) {
+@@ -1691,7 +1857,13 @@ export default function (view) {
                  capture: true,
                  passive: true
              });
@@ -256,7 +551,7 @@ index fdde2c558253161aeae75afe34fe46056d2ed5ae..b5e81df4e512ca697bd4bad08ea14ac5
                  capture: true,
                  passive: true
              });
-@@ -1716,7 +1888,10 @@ export default function (view) {
+@@ -1718,7 +1890,10 @@ export default function (view) {
              statsOverlay.enabled(false);
          }
  
@@ -267,7 +562,7 @@ index fdde2c558253161aeae75afe34fe46056d2ed5ae..b5e81df4e512ca697bd4bad08ea14ac5
          dom.removeEventListener(document, 'keydown', onKeyDownCapture, {
              capture: true,
              passive: true
-@@ -1732,7 +1907,13 @@ export default function (view) {
+@@ -1734,7 +1909,13 @@ export default function (view) {
              capture: true,
              passive: true
          });
@@ -282,7 +577,7 @@ index fdde2c558253161aeae75afe34fe46056d2ed5ae..b5e81df4e512ca697bd4bad08ea14ac5
              capture: true,
              passive: true
          });
-@@ -1787,48 +1968,49 @@ export default function (view) {
+@@ -1789,48 +1970,49 @@ export default function (view) {
  
          destroyStats();
          destroySubtitleSync();
@@ -492,7 +787,7 @@ index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..1c14e3806f40570cacfba626a0929242
      }
  
 diff --git a/src/plugins/htmlVideoPlayer/plugin.js b/src/plugins/htmlVideoPlayer/plugin.js
-index 4a5951b47b3f6088d867681c0bd4415cd78a268c..8e05683ddb933b4b8cfd09e3dee2163fda89c5ab 100644
+index 4a5951b47b3f6088d867681c0bd4415cd78a268c..81a57331f9fbbed5259de0e02d1cb1cd665ec50f 100644
 --- a/src/plugins/htmlVideoPlayer/plugin.js
 +++ b/src/plugins/htmlVideoPlayer/plugin.js
 @@ -1,4 +1,3 @@
@@ -516,7 +811,7 @@ index 4a5951b47b3f6088d867681c0bd4415cd78a268c..8e05683ddb933b4b8cfd09e3dee2163f
 +const SRT_SUBTITLE_CODECS = ['srt', 'subrip'];
  const VOBSUB_SUBTITLE_CODECS = ['dvdsub', 'vobsub'];
  const BITMAP_SUBTITLE_ASPECT_MODES = ['stretch', 'contain', 'cover'];
-+const PLAYBACK_DIAGNOSTIC_VERSION = '2026-08-18.4';
++const PLAYBACK_DIAGNOSTIC_VERSION = '2026-09-14.1';
 +const PLAYBACK_DIAGNOSTIC_EVENTS = [
 +    'loadstart',
 +    'loadedmetadata',
@@ -2117,10 +2412,10 @@ index 0000000000000000000000000000000000000000..6f78ea628538425bf00854156c400955
 +}
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.test.ts b/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..bcdc87ff30f968c383f1f189f49d38e1e6e3cde9
+index 0000000000000000000000000000000000000000..d0f1347dc36c03b84ac503e07758280d5cea4a76
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.test.ts
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,182 @@
 +import { describe, expect, it, vi } from 'vitest';
 +
 +import { SubtitleClock } from './SubtitleClock';
@@ -2160,6 +2455,43 @@ index 0000000000000000000000000000000000000000..bcdc87ff30f968c383f1f189f49d38e1
 +}
 +
 +describe('SubtitleClock', () => {
++    it('recovers from waiting when decoded frames advance without another playing event', () => {
++        const harness = createVideoFrameHarness();
++        const clock = new SubtitleClock(harness.video);
++        Object.defineProperties(harness.video, {
++            currentTime: { configurable: true, writable: true, value: 1 },
++            readyState: { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA }
++        });
++        harness.video.dispatchEvent(new Event('waiting'));
++        clock.onVideoFrame(0, {} as VideoFrameCallbackMetadata);
++        expect(clock.snapshot().paused).toBe(true);
++        harness.video.currentTime = 2;
++        clock.onVideoFrame(1, {} as VideoFrameCallbackMetadata);
++        expect(clock.snapshot().paused).toBe(false);
++        clock.dispose();
++    });
++
++    it('uses timeupdate progress to recover on browsers without video frame callbacks', () => {
++        const video = document.createElement('video');
++        Object.defineProperties(video, {
++            paused: { configurable: true, value: false },
++            seeking: { configurable: true, writable: true, value: false },
++            currentTime: { configurable: true, writable: true, value: 1 },
++            readyState: { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA }
++        });
++        const clock = new SubtitleClock(video);
++        video.dispatchEvent(new Event('waiting'));
++        video.currentTime = 2;
++        video.dispatchEvent(new Event('timeupdate'));
++        expect(clock.snapshot().paused).toBe(false);
++        Object.defineProperty(video, 'seeking', { configurable: true, value: true });
++        video.dispatchEvent(new Event('seeking'));
++        video.currentTime = 10;
++        video.dispatchEvent(new Event('timeupdate'));
++        expect(clock.snapshot().paused).toBe(true);
++        clock.dispose();
++    });
++
 +    it('cancels and rearms video-frame callbacks across repeated media sources', () => {
 +        const harness = createVideoFrameHarness();
 +        const clock = new SubtitleClock(harness.video);
@@ -2268,10 +2600,10 @@ index 0000000000000000000000000000000000000000..bcdc87ff30f968c383f1f189f49d38e1
 +});
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.ts b/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..fbfc182de258a358bc6430803cf64182c46079c2
+index 0000000000000000000000000000000000000000..b5cef2bba40f2c223dbd31f3b36cce0452dac992
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/SubtitleClock.ts
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,181 @@
 +import type {
 +    SubtitleClockReason,
 +    SubtitleClockSnapshot
@@ -2312,11 +2644,13 @@ index 0000000000000000000000000000000000000000..fbfc182de258a358bc6430803cf64182
 +    readonly listeners = new Set<SubtitleClockListener>();
 +    disposed = false;
 +    buffering = false;
++    lastObservedTime: number;
 +    videoFrameHandle?: number;
 +    animationFrameHandle?: number;
 +
 +    constructor(videoElement: HTMLVideoElement) {
 +        this.videoElement = videoElement;
++        this.lastObservedTime = videoElement.currentTime;
 +
 +        for (const eventName of VIDEO_EVENTS) {
 +            videoElement.addEventListener(eventName, this.onVideoEvent);
@@ -2363,6 +2697,7 @@ index 0000000000000000000000000000000000000000..fbfc182de258a358bc6430803cf64182
 +
 +    onVideoEvent = (event: Event) => {
 +        const reason = event.type as SubtitleClockReason;
++        this.lastObservedTime = this.videoElement.currentTime;
 +        if (
 +            reason === 'loadstart'
 +            || reason === 'emptied'
@@ -2387,12 +2722,14 @@ index 0000000000000000000000000000000000000000..fbfc182de258a358bc6430803cf64182
 +    onTimeUpdate = () => {
 +        // timeupdate is a fallback heartbeat for browsers and WebViews that
 +        // do not reliably deliver video-frame callbacks.
++        this.observeProgress();
 +        this.pulse('frame');
 +        this.scheduleFrame();
 +    };
 +
 +    onVideoFrame: VideoFrameRequestCallback = () => {
 +        this.videoFrameHandle = undefined;
++        this.observeProgress();
 +        this.pulse('frame');
 +        this.scheduleFrame();
 +    };
@@ -2404,6 +2741,21 @@ index 0000000000000000000000000000000000000000..fbfc182de258a358bc6430803cf64182
 +        }
 +        this.scheduleFrame();
 +    };
++
++    observeProgress() {
++        const video = this.videoElement;
++        if (
++            this.buffering
++            && !video.paused
++            && !video.seeking
++            && !video.ended
++            && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
++            && video.currentTime > this.lastObservedTime
++        ) {
++            this.buffering = false;
++        }
++        this.lastObservedTime = video.currentTime;
++    }
 +
 +    cancelScheduledFrame() {
 +        if (this.videoFrameHandle !== undefined) {
@@ -2784,10 +3136,10 @@ index 0000000000000000000000000000000000000000..bcac83be5f8e4e3c6f96880a73e11ddb
 +});
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..7b1812f84283705f44bccc542bebcb6f77338357
+index 0000000000000000000000000000000000000000..1e46c9c095e4ea1dab664479f523cfca11785b71
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/TextSubtitlePipeline.ts
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,359 @@
 +import { SubtitleClock } from './SubtitleClock';
 +import type {
 +    SubtitleClockSnapshot,
@@ -2810,6 +3162,7 @@ index 0000000000000000000000000000000000000000..7b1812f84283705f44bccc542bebcb6f
 +    trackIndex: number;
 +    cancel(): void;
 +    promise: Promise<void>;
++    renderer?: SubtitleRenderer;
 +}
 +
 +interface SubtitleSlotState {
@@ -2884,6 +3237,16 @@ index 0000000000000000000000000000000000000000..7b1812f84283705f44bccc542bebcb6f
 +    setOffset(slot: SubtitleSlot, offsetSeconds: number) {
 +        const state = this.getOrCreateSlot(slot);
 +        state.offsetSeconds = offsetSeconds;
++
++        if (state.loading?.renderer) {
++            try {
++                state.loading.renderer.setOffset(offsetSeconds);
++                state.loading.renderer.update(this.clock.snapshot('manual'));
++            } catch (error) {
++                this.safeDispose(state.loading.renderer);
++                console.debug('Unable to offset preparing subtitle renderer', error);
++            }
++        }
 +
 +        if (!state.active) return;
 +        try {
@@ -3006,8 +3369,8 @@ index 0000000000000000000000000000000000000000..7b1812f84283705f44bccc542bebcb6f
 +
 +                renderer.setOffset(state.offsetSeconds);
 +                const snapshot = this.clock.snapshot('selection');
-+                renderer.activate(snapshot);
-+                renderer.update(snapshot);
++                state.loading!.renderer = renderer;
++                await renderer.activate(snapshot);
 +                if (preparationError) throw preparationError;
 +
 +                if (!isCurrent()) {
@@ -3116,6 +3479,15 @@ index 0000000000000000000000000000000000000000..7b1812f84283705f44bccc542bebcb6f
 +
 +    onClock = (snapshot: SubtitleClockSnapshot) => {
 +        for (const [ slot, state ] of this.slots) {
++            const loading = state.loading;
++            if (loading?.renderer) {
++                try {
++                    loading.renderer.update(snapshot);
++                } catch (error) {
++                    this.safeDispose(loading.renderer);
++                    console.debug('Unable to update preparing subtitle renderer', error);
++                }
++            }
 +            const active = state.active;
 +            if (!active) continue;
 +
@@ -3129,90 +3501,88 @@ index 0000000000000000000000000000000000000000..7b1812f84283705f44bccc542bebcb6f
 +}
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..b133a024ea844f4edeae2663910aa8a799de12e4
+index 0000000000000000000000000000000000000000..4a0ce64593d265f5229d4fc6a93bd72cc0c958ac
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.test.ts
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,324 @@
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +
-+import type { SubtitleLoadRequest } from '../types';
-+import {
-+    computeAssRenderSize,
-+    createAssRendererAdapter
-+} from './AssRendererAdapter';
++import { TextSubtitlePipeline } from '../TextSubtitlePipeline';
++import type { SubtitleLoadRequest, SubtitleRenderer } from '../types';
++import { computeAssRenderSize, createAssRendererAdapter } from './AssRendererAdapter';
 +
-+interface MockOctopusOptions extends Record<string, unknown> {
-+    canvas?: HTMLCanvasElement;
-+    video?: HTMLVideoElement;
-+    renderAhead?: number;
-+    fonts?: string[];
-+    onReady(): void;
++interface MockOptions extends Record<string, unknown> {
++    canvas: HTMLCanvasElement;
++    fonts: string[];
 +    onError(error: unknown): void;
 +}
 +
-+const octopusMock = vi.hoisted(() => ({
-+    instances: [] as MockOctopus[]
-+}));
++interface RenderMessage {
++    target: string;
++    iteration?: number;
++    lastRendered?: number;
++    renderNow?: boolean;
++}
 +
++class MockWorker extends EventTarget {
++    messages: RenderMessage[] = [];
++    postMessage(message: RenderMessage) {
++        this.messages.push(message);
++    }
++    emit(data: unknown) {
++        this.dispatchEvent(new MessageEvent('message', { data }));
++    }
++    ready() {
++        this.emit({ target: 'get-styles', styles: [] });
++    }
++    frame(message = this.messages.filter(m => m.target === 'oneshot-render').at(-1)) {
++        this.emit({ target: 'canvas', op: 'oneshot-result', iteration: message?.iteration, canvases: [] });
++    }
++}
++
++const octopusMock = vi.hoisted(() => ({ instances: [] as MockOctopus[] }));
 +class MockOctopus {
-+    readonly options: MockOctopusOptions;
-+    readonly resizeCalls: unknown[][] = [];
-+    readonly currentTimeCalls: number[] = [];
-+    readonly pausedCalls: [boolean, number][] = [];
-+    readonly rateCalls: number[] = [];
++    readonly worker = new MockWorker();
++    readonly onWorkerMessage = vi.fn();
 +    disposed = false;
-+
-+    constructor(options: MockOctopusOptions) {
-+        this.options = options;
++    constructor(readonly options: MockOptions) {
 +        octopusMock.instances.push(this);
++        this.worker.addEventListener('message', this.onWorkerMessage);
 +    }
-+
-+    resize(...args: unknown[]) {
-+        this.resizeCalls.push(args);
++    resize(width: number, height: number) {
++        this.options.canvas.width = width;
++        this.options.canvas.height = height;
 +    }
-+
-+    setCurrentTime(time: number) {
-+        this.currentTimeCalls.push(time);
-+    }
-+
-+    setIsPaused(paused: boolean, time: number) {
-+        this.pausedCalls.push([ paused, time ]);
-+    }
-+
-+    setRate(rate: number) {
-+        this.rateCalls.push(rate);
-+    }
-+
 +    dispose() {
 +        this.disposed = true;
 +    }
 +}
 +
-+vi.mock('@jellyfin/libass-wasm', () => ({
-+    default: MockOctopus
-+}));
++vi.mock('@jellyfin/libass-wasm', () => ({ default: MockOctopus }));
++
++const renderers: SubtitleRenderer[] = [];
++const pipelines: TextSubtitlePipeline[] = [];
++const clearRect = vi.fn();
 +
 +function createRequest() {
 +    let current = true;
 +    let cancel: (() => void) | undefined;
-+    const reportRuntimeError = vi.fn();
 +    const request: SubtitleLoadRequest = {
 +        isCurrent: () => current,
 +        onCancel: callback => {
 +            cancel = callback;
 +            return () => {
-+                if (cancel === callback) cancel = undefined;
++                cancel = undefined;
 +            };
 +        },
-+        reportRuntimeError
++        reportRuntimeError: vi.fn()
 +    };
-+
 +    return {
 +        request,
-+        reportRuntimeError,
-+        cancel: () => cancel?.(),
-+        invalidate: () => {
++        invalidate: () => { current = false; },
++        cancel: () => {
 +            current = false;
++            cancel?.();
 +        }
 +    };
 +}
@@ -3225,7 +3595,8 @@ index 0000000000000000000000000000000000000000..b133a024ea844f4edeae2663910aa8a7
 +        videoWidth: { configurable: true, value: 1920 },
 +        videoHeight: { configurable: true, value: 1080 },
 +        offsetWidth: { configurable: true, value: 1280 },
-+        offsetHeight: { configurable: true, value: 720 }
++        offsetHeight: { configurable: true, value: 720 },
++        currentTime: { configurable: true, writable: true, value: 3 }
 +    });
 +    return { parent, video };
 +}
@@ -3235,10 +3606,7 @@ index 0000000000000000000000000000000000000000..b133a024ea844f4edeae2663910aa8a7
 +        videoElement,
 +        subtitleUrl: 'https://example.test/subtitle.ass',
 +        fonts: [ 'https://example.test/bridge.ttf' ],
-+        fallbackFonts: [
-+            'https://example.test/bridge.ttf',
-+            'https://example.test/embedded.ttf'
-+        ],
++        fallbackFonts: [ 'https://example.test/bridge.ttf', 'https://example.test/embedded.ttf' ],
 +        workerUrl: '/worker.js',
 +        legacyWorkerUrl: '/worker-legacy.js',
 +        baseTimeOffsetSeconds: 2,
@@ -3247,184 +3615,226 @@ index 0000000000000000000000000000000000000000..b133a024ea844f4edeae2663910aa8a7
 +    };
 +}
 +
++const snapshot = (currentTime: number, reason: 'selection' | 'frame' | 'seeking' | 'seeked' | 'loadedmetadata' = 'frame') => (
++    { currentTime, paused: false, playbackRate: 1, reason }
++);
++
++async function loadRenderer() {
++    const { parent, video } = createVideo();
++    const request = createRequest();
++    const promise = createAssRendererAdapter(createOptions(request.request, video));
++    await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++    const octopus = octopusMock.instances[0];
++    octopus.worker.ready();
++    const renderer = await promise;
++    renderers.push(renderer);
++    return { parent, video, request, renderer, octopus };
++}
++
 +beforeEach(() => {
 +    octopusMock.instances = [];
++    clearRect.mockClear();
++    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
++        clearRect,
++        createImageData: (w: number, h: number) => ({ data: new Uint8ClampedArray(w * h * 4) }),
++        putImageData: vi.fn(),
++        drawImage: vi.fn()
++    } as unknown as CanvasRenderingContext2D);
 +});
 +
 +afterEach(() => {
++    pipelines.splice(0).forEach(p => {
++        p.dispose();
++    });
++    renderers.splice(0).forEach(r => {
++        r.dispose();
++    });
 +    vi.useRealTimers();
 +});
 +
-+describe('computeAssRenderSize', () => {
++describe('ASS worker lifecycle', () => {
 +    it('matches libass prescaling for high-DPI and 4K canvases', () => {
-+        expect(computeAssRenderSize(1920, 1080, 1))
-+            .toEqual({ width: 1920, height: 1080 });
-+        expect(computeAssRenderSize(1920, 1080, 2))
-+            .toEqual({ width: 3072, height: 1728 });
-+    });
-+});
-+
-+describe('AssRendererAdapter', () => {
-+    it('uses manual canvas mode and follows the shared subtitle clock', async () => {
-+        const { parent, video } = createVideo();
-+        const request = createRequest();
-+        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
-+        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
-+        const host = parent.querySelector<HTMLElement>('.subtitle-pipeline-ass');
-+        expect(host?.style.position).toBe('absolute');
-+        expect(host?.style.inset).toBe('0px');
-+        expect(host?.style.width).toBe('100%');
-+        expect(host?.style.height).toBe('100%');
-+        expect(host?.style.visibility).toBe('hidden');
-+        octopusMock.instances[0].options.onReady();
-+        const renderer = await rendererPromise;
-+        const octopus = octopusMock.instances[0];
-+
-+        expect(octopus.options.canvas).toBeInstanceOf(HTMLCanvasElement);
-+        expect(octopus.options.video).toBeUndefined();
-+        expect(octopus.options.renderAhead).toBe(0);
-+
-+        renderer.activate({ currentTime: 3, paused: false, playbackRate: 1.5, reason: 'selection' });
-+        expect(host?.style.visibility).toBe('visible');
-+        expect(host?.style.position).toBe('absolute');
-+        expect(octopus.currentTimeCalls.at(-1)).toBe(5);
-+        expect(octopus.rateCalls.at(-1)).toBe(1.5);
-+        expect(octopus.pausedCalls.at(-1)).toEqual([ false, 5 ]);
-+
-+        renderer.setOffset(1);
-+        renderer.update({ currentTime: 10, paused: true, playbackRate: 1, reason: 'seeked' });
-+        expect(octopus.currentTimeCalls.at(-1)).toBe(13);
-+        expect(octopus.pausedCalls.at(-1)).toEqual([ true, 13 ]);
-+
-+        renderer.dispose();
-+        expect(octopus.disposed).toBe(true);
-+        expect(parent.querySelector('.subtitle-pipeline-ass')).toBeNull();
++        expect(computeAssRenderSize(1920, 1080, 1)).toEqual({ width: 1920, height: 1080 });
++        expect(computeAssRenderSize(1920, 1080, 2)).toEqual({ width: 3072, height: 1728 });
 +    });
 +
-+    it('retries initialization with embedded fallback fonts', async () => {
-+        vi.useFakeTimers();
++    it('ignores early worker messages and waits for the initialized track', async () => {
 +        const { video } = createVideo();
-+        const request = createRequest();
-+        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
-+
++        const { request } = createRequest();
++        let resolved = false;
++        const promise = createAssRendererAdapter(createOptions(request, video)).then(renderer => {
++            resolved = true;
++            renderers.push(renderer);
++        });
 +        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
-+        octopusMock.instances[0].options.onError(new Error('font failure'));
-+        await vi.advanceTimersByTimeAsync(0);
++        const octopus = octopusMock.instances[0];
++        expect(octopus.worker.messages).toContainEqual({ target: 'get-styles' });
++        octopus.worker.emit({ target: 'ready' });
++        octopus.worker.emit({ target: 'stdout', content: 'loading fonts' });
++        await Promise.resolve();
++        expect(resolved).toBe(false);
++        octopus.worker.ready();
++        await promise;
++        expect(resolved).toBe(true);
++    });
++
++    it('keeps the old track until the first ASS frame, including an empty frame', async () => {
++        const { video, parent } = createVideo();
++        const pipeline = new TextSubtitlePipeline(video);
++        pipelines.push(pipeline);
++        const previous = { activate: vi.fn(), update: vi.fn(), setOffset: vi.fn(), dispose: vi.fn() };
++        await pipeline.select(0, 1, async () => previous);
++        const selection = pipeline.select(0, 2, request => createAssRendererAdapter(createOptions(request, video)));
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++        const octopus = octopusMock.instances[0];
++        octopus.worker.ready();
++        await vi.waitFor(() => expect(octopus.worker.messages.at(-1)?.target).toBe('oneshot-render'));
++        expect(previous.dispose).not.toHaveBeenCalled();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(1);
++        expect(parent.querySelector<HTMLElement>('.subtitle-pipeline-ass')?.style.visibility).toBe('hidden');
++        octopus.worker.frame();
++        await selection;
++        expect(previous.dispose).toHaveBeenCalledOnce();
++        expect(pipeline.getActiveTrackIndex(0)).toBe(2);
++        expect(parent.querySelector<HTMLElement>('.subtitle-pipeline-ass')?.style.visibility).toBe('visible');
++    });
++
++    it('coalesces delayed frames and discards pre-seek responses', async () => {
++        const { renderer, octopus, parent } = await loadRenderer();
++        const activation = renderer.activate(snapshot(40, 'selection'));
++        const stale = octopus.worker.messages.at(-1);
++        renderer.update(snapshot(0, 'seeking'));
++        renderer.update(snapshot(0, 'seeked'));
++        expect(octopus.worker.messages.filter(m => m.target === 'oneshot-render')).toHaveLength(1);
++        octopus.worker.frame(stale);
++        expect(parent.querySelector<HTMLElement>('.subtitle-pipeline-ass')?.style.visibility).toBe('hidden');
++        expect(octopus.worker.messages.at(-1)).toMatchObject({ lastRendered: 2, renderNow: true });
++        octopus.worker.frame();
++        await activation;
++        const clears = clearRect.mock.calls.length;
++        octopus.worker.frame(stale);
++        expect(clearRect).toHaveBeenCalledTimes(clears);
++        renderer.update(snapshot(0));
++        expect(octopus.worker.messages.filter(m => m.target === 'oneshot-render')).toHaveLength(2);
++    });
++
++    it('refreshes a stale first frame to the latest playback time', async () => {
++        const { renderer, octopus } = await loadRenderer();
++        const activation = renderer.activate(snapshot(1, 'selection'));
++        renderer.update(snapshot(10));
++        octopus.worker.frame();
++        expect(octopus.worker.messages.at(-1)?.lastRendered).toBe(12);
++        octopus.worker.frame();
++        await activation;
++    });
++
++    it('resizes when metadata arrives even without a layout change', async () => {
++        const { renderer, video, octopus } = await loadRenderer();
++        Object.defineProperty(video, 'videoWidth', { configurable: true, value: 0 });
++        const activation = renderer.activate(snapshot(3, 'selection'));
++        expect(octopus.worker.messages.filter(m => m.target === 'oneshot-render')).toHaveLength(0);
++        Object.defineProperty(video, 'videoWidth', { configurable: true, value: 1920 });
++        renderer.update(snapshot(3, 'loadedmetadata'));
++        expect(octopus.options.canvas.width).toBe(1280);
++        octopus.worker.frame();
++        await activation;
++    });
++
++    it('recovers real pipeline runtime errors after loading is no longer current', async () => {
++        const { video } = createVideo();
++        const changes = vi.fn();
++        const pipeline = new TextSubtitlePipeline(video, { onStateChange: changes });
++        pipelines.push(pipeline);
++        let activeRequest: SubtitleLoadRequest | undefined;
++        const factory = (request: SubtitleLoadRequest) => {
++            activeRequest = request;
++            return createAssRendererAdapter(createOptions(request, video));
++        };
++        const selection = pipeline.select(0, 2, factory);
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++        octopusMock.instances[0].worker.ready();
++        await vi.waitFor(() => expect(octopusMock.instances[0].worker.messages.at(-1)?.target).toBe('oneshot-render'));
++        octopusMock.instances[0].worker.frame();
++        await selection;
++        expect(activeRequest?.isCurrent()).toBe(false);
++        octopusMock.instances[0].options.onError(new Error('worker stopped'));
 +        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(2));
-+        octopusMock.instances[1].options.onReady();
-+        const renderer = await rendererPromise;
-+
++        octopusMock.instances[1].worker.ready();
++        await vi.waitFor(() => expect(octopusMock.instances[1].worker.messages.at(-1)?.target).toBe('oneshot-render'));
++        octopusMock.instances[1].worker.frame();
++        await vi.waitFor(() => expect(pipeline.getActiveTrackIndex(0)).toBe(2));
++        octopusMock.instances[1].options.onError(new Error('worker stopped again'));
++        await Promise.resolve();
++        expect(changes).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'failed' }));
 +        expect(octopusMock.instances).toHaveLength(2);
-+        expect(octopusMock.instances[0].options.fonts)
-+            .toEqual([ 'https://example.test/bridge.ttf' ]);
-+        expect(octopusMock.instances[1].options.fonts).toEqual([
-+            'https://example.test/bridge.ttf',
-+            'https://example.test/embedded.ttf'
-+        ]);
-+        renderer.dispose();
 +    });
 +
-+    it('reports worker failures that happen after activation', async () => {
++    it('retries with embedded fonts and ignores callbacks from a retired attempt', async () => {
 +        const { video } = createVideo();
-+        const request = createRequest();
-+        const onRuntimeFallbackRequested = vi.fn();
-+        const rendererPromise = createAssRendererAdapter({
-+            ...createOptions(request.request, video),
-+            onRuntimeFallbackRequested
-+        });
++        const { request } = createRequest();
++        const promise = createAssRendererAdapter(createOptions(request, video));
 +        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
-+        octopusMock.instances[0].options.onReady();
-+        const renderer = await rendererPromise;
-+        const error = new Error('worker stopped');
-+
-+        octopusMock.instances[0].options.onError(error);
-+        expect(onRuntimeFallbackRequested).toHaveBeenCalledOnce();
-+        expect(request.reportRuntimeError).toHaveBeenCalledWith(error);
-+        renderer.dispose();
++        const retired = octopusMock.instances[0];
++        retired.options.onError(new Error('font failure'));
++        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(2));
++        retired.worker.ready();
++        retired.options.onError(new Error('late failure'));
++        expect(octopusMock.instances[1].disposed).toBe(false);
++        expect(octopusMock.instances[1].options.fonts).toHaveLength(2);
++        octopusMock.instances[1].worker.ready();
++        renderers.push(await promise);
 +    });
 +
-+    it('cancels an unfinished renderer without leaving a canvas behind', async () => {
-+        const { parent, video } = createVideo();
-+        const request = createRequest();
-+        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
-+
-+        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
++    it('cancels activation without exposing a late frame', async () => {
++        const { renderer, request, octopus, parent } = await loadRenderer();
++        const activation = renderer.activate(snapshot(3, 'selection'));
++        const rejection = expect(activation).rejects.toThrow('cancelled');
 +        request.cancel();
-+
-+        await expect(rendererPromise).rejects.toThrow('cancelled');
-+        expect(octopusMock.instances[0].disposed).toBe(true);
-+        expect(parent.querySelector('.subtitle-pipeline-ass')).toBeNull();
-+    });
-+    it('times out an ASS worker that never becomes ready', async () => {
-+        vi.useFakeTimers();
-+        const { parent, video } = createVideo();
-+        const request = createRequest();
-+        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
-+        const rejection = expect(rendererPromise).rejects.toThrow('did not become ready within 10 seconds');
-+
-+        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
-+        await vi.advanceTimersByTimeAsync(10_000);
++        octopus.worker.frame();
 +        await rejection;
-+
-+        expect(octopusMock.instances[0].disposed).toBe(true);
 +        expect(parent.querySelector('.subtitle-pipeline-ass')).toBeNull();
 +    });
-+    it('clears stale ASS pixels immediately and resynchronizes after seeking', async () => {
-+        const { parent, video } = createVideo();
-+        const request = createRequest();
-+        let scheduledFrame: FrameRequestCallback | undefined;
-+        const requestFrame = vi.spyOn(window, 'requestAnimationFrame')
-+            .mockImplementation(callback => {
-+                scheduledFrame = callback;
-+                return 41;
-+            });
-+        const cancelFrame = vi.spyOn(window, 'cancelAnimationFrame')
-+            .mockImplementation(() => undefined);
 +
-+        const rendererPromise = createAssRendererAdapter(createOptions(request.request, video));
++    it('times out actual track readiness even after an early ready message', async () => {
++        vi.useFakeTimers();
++        const { video } = createVideo();
++        const { request } = createRequest();
++        const promise = createAssRendererAdapter({ ...createOptions(request, video), fallbackFonts: [] });
++        const rejection = expect(promise).rejects.toThrow('within 30 seconds');
 +        await vi.waitFor(() => expect(octopusMock.instances).toHaveLength(1));
-+        octopusMock.instances[0].options.onReady();
-+        const renderer = await rendererPromise;
-+        renderer.activate({ currentTime: 40, paused: false, playbackRate: 1, reason: 'selection' });
++        octopusMock.instances[0].worker.emit({ target: 'ready' });
++        await vi.advanceTimersByTimeAsync(30_000);
++        await rejection;
++        expect(octopusMock.instances[0].disposed).toBe(true);
++    });
 +
-+        const canvas = parent.querySelector<HTMLCanvasElement>('.libassjs-canvas');
-+        expect(canvas).not.toBeNull();
-+        let canvasWidth = canvas?.width || 0;
-+        let clearCount = 0;
-+        Object.defineProperty(canvas, 'width', {
-+            configurable: true,
-+            get: () => canvasWidth,
-+            set: value => {
-+                clearCount++;
-+                canvasWidth = value;
-+            }
-+        });
++    it('rejects a first frame that never arrives', async () => {
++        vi.useFakeTimers();
++        const { renderer } = await loadRenderer();
++        const rejection = expect(renderer.activate(snapshot(3, 'selection'))).rejects.toThrow('within 5 seconds');
++        await vi.advanceTimersByTimeAsync(5_000);
++        await rejection;
++    });
 +
-+        const octopus = octopusMock.instances[0];
-+        renderer.update({ currentTime: 0, paused: false, playbackRate: 1, reason: 'seeking' });
-+
-+        expect(clearCount).toBe(1);
-+        expect(octopus.pausedCalls.at(-1)).toEqual([ true, 2 ]);
-+        expect(octopus.currentTimeCalls.at(-1)).toBe(2);
-+
-+        renderer.update({ currentTime: 0, paused: false, playbackRate: 1, reason: 'seeked' });
-+        expect(requestFrame).toHaveBeenCalledOnce();
-+        scheduledFrame?.(performance.now());
-+
-+        expect(octopus.pausedCalls.at(-1)).toEqual([ false, 2 ]);
-+        expect(octopus.currentTimeCalls.at(-1)).toBe(2);
-+
-+        renderer.dispose();
-+        requestFrame.mockRestore();
-+        cancelFrame.mockRestore();
++    it('bounds activation even when a slow worker keeps returning obsolete frames', async () => {
++        vi.useFakeTimers();
++        const { renderer, octopus } = await loadRenderer();
++        const rejection = expect(renderer.activate(snapshot(0, 'selection'))).rejects.toThrow('within 10 seconds');
++        for (let time = 1; time <= 9; time++) {
++            await vi.advanceTimersByTimeAsync(1_000);
++            renderer.update(snapshot(time));
++            octopus.worker.frame();
++        }
++        await vi.advanceTimersByTimeAsync(1_000);
++        await rejection;
 +    });
 +});
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..5170653845f7fc69d9802291a16cd44b2dd7f7fb
+index 0000000000000000000000000000000000000000..48b189561dff39e480c6a1be6e0dd4e0498ea477
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/renderers/AssRendererAdapter.ts
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,423 @@
 +import type {
 +    SubtitleClockSnapshot,
 +    SubtitleLoadRequest,
@@ -3434,7 +3844,8 @@ index 0000000000000000000000000000000000000000..5170653845f7fc69d9802291a16cd44b
 +const PRESCALE_FACTOR = 0.8;
 +const PRESCALE_HEIGHT_LIMIT = 1080;
 +const MAX_RENDER_HEIGHT = 2160;
-+const RENDERER_READY_TIMEOUT_MS = 10_000;
++const RENDERER_READY_TIMEOUT_MS = 30_000;
++const FRAME_TIMEOUT_MS = 5_000;
 +
 +export function computeAssRenderSize(width: number, height: number, pixelRatio: number) {
 +    const sourceWidth = width * pixelRatio;
@@ -3472,10 +3883,9 @@ index 0000000000000000000000000000000000000000..5170653845f7fc69d9802291a16cd44b
 +}
 +
 +interface SubtitlesOctopusInstance {
++    worker: Worker;
++    onWorkerMessage(event: MessageEvent): void;
 +    resize(width?: number, height?: number, top?: number, left?: number): void;
-+    setCurrentTime(time: number): void;
-+    setIsPaused(paused: boolean, time: number): void;
-+    setRate(rate: number): void;
 +    dispose(): void;
 +}
 +
@@ -3483,21 +3893,40 @@ index 0000000000000000000000000000000000000000..5170653845f7fc69d9802291a16cd44b
 +    options: Record<string, unknown>
 +) => SubtitlesOctopusInstance;
 +
++interface AssFrame {
++    target: string;
++    op?: string;
++    iteration: number;
++    canvases: Array<{ w: number; h: number; x: number; y: number; buffer: ArrayBuffer }>;
++}
++
++interface FrameRequest {
++    id: number;
++    epoch: number;
++    time: number;
++}
++
 +export class AssRendererAdapter implements SubtitleRenderer {
 +    readonly videoElement: HTMLVideoElement;
 +    readonly host: HTMLDivElement;
 +    readonly canvas: HTMLCanvasElement;
++    readonly bufferCanvas = document.createElement('canvas');
 +    readonly renderer: SubtitlesOctopusInstance;
-+    readonly baseTimeOffsetSeconds: number;
-+    readonly targetFps: number;
++    readonly worker: Worker;
++    readonly options: AssRendererOptions;
 +    readonly resizeObserver?: ResizeObserver;
 +    offsetSeconds = 0;
-+    lastRate?: number;
-+    lastPaused?: boolean;
++    latestTime?: number;
 +    lastRenderedTime?: number;
-+    resyncFrameHandle?: number;
++    pending?: FrameRequest;
++    nextId = 0;
++    epoch = 0;
++    frameTimeout?: number;
++    activationTimeout?: number;
++    activation?: { resolve(): void; reject(error: unknown): void };
 +    active = false;
 +    disposed = false;
++    failed = false;
 +
 +    constructor(
 +        options: AssRendererOptions,
@@ -3505,13 +3934,18 @@ index 0000000000000000000000000000000000000000..5170653845f7fc69d9802291a16cd44b
 +        canvas: HTMLCanvasElement,
 +        renderer: SubtitlesOctopusInstance
 +    ) {
++        this.options = options;
 +        this.videoElement = options.videoElement;
 +        this.host = host;
 +        this.canvas = canvas;
 +        this.renderer = renderer;
-+        this.baseTimeOffsetSeconds = options.baseTimeOffsetSeconds;
-+        this.targetFps = Math.max(1, options.targetFps || 24);
++        this.worker = renderer.worker;
 +
++        // Use libass 4.2.4's existing forced, timestamped oneshot protocol.
++        // Octopus' autonomous canvas/cache handlers must not repaint an old
++        // frame after a seek or renderer replacement.
++        renderer.worker.removeEventListener('message', renderer.onWorkerMessage);
++        renderer.worker.addEventListener('message', this.onWorkerMessage);
 +        if (typeof ResizeObserver !== 'undefined') {
 +            this.resizeObserver = new ResizeObserver(this.resize);
 +            this.resizeObserver.observe(this.videoElement);
@@ -3521,116 +3955,161 @@ index 0000000000000000000000000000000000000000..5170653845f7fc69d9802291a16cd44b
 +    }
 +
 +    activate(snapshot: SubtitleClockSnapshot) {
-+        if (this.disposed) return;
++        if (this.disposed) return Promise.reject(new Error('ASS renderer was disposed'));
 +        this.active = true;
-+        this.resize();
-+        this.clearCanvas();
-+        this.update(snapshot);
-+        // The canvas starts hidden and is only exposed after its final size and
-+        // clock state are applied. This avoids briefly painting libass' default
-+        // canvas size while switching from a text renderer.
-+        this.host.style.visibility = 'visible';
++        return new Promise<void>((resolve, reject) => {
++            this.activation = { resolve, reject };
++            this.update(snapshot);
++        });
 +    }
 +
 +    update(snapshot: SubtitleClockSnapshot) {
-+        if (this.disposed || !this.active) return;
-+
-+        const effectiveTime = snapshot.currentTime
-+            + this.baseTimeOffsetSeconds
++        if (this.disposed || this.failed || !this.active) return;
++        this.latestTime = snapshot.currentTime
++            + this.options.baseTimeOffsetSeconds
 +            + this.offsetSeconds;
-+        const force = snapshot.reason !== 'frame';
-+        const discontinuity = snapshot.reason === 'loadstart'
-+            || snapshot.reason === 'emptied'
-+            || snapshot.reason === 'seeking';
-+        const rendererPaused = snapshot.paused || discontinuity;
 +
-+        if (discontinuity) {
-+            this.cancelResync();
-+            this.clearCanvas();
-+            this.lastRenderedTime = undefined;
-+        }
-+
-+        if (force || this.lastRate !== snapshot.playbackRate) {
-+            this.lastRate = snapshot.playbackRate;
-+            this.renderer.setRate(snapshot.playbackRate);
-+        }
-+        if (force || this.lastPaused !== rendererPaused) {
-+            this.lastPaused = rendererPaused;
-+            this.renderer.setIsPaused(rendererPaused, effectiveTime);
-+        }
-+
-+        const minimumInterval = 1 / this.targetFps;
-+        if (
-+            force
-+            || this.lastRenderedTime === undefined
-+            || Math.abs(effectiveTime - this.lastRenderedTime) >= minimumInterval
-+        ) {
-+            this.lastRenderedTime = effectiveTime;
-+            this.renderer.setCurrentTime(effectiveTime);
-+        }
-+
-+        if (
-+            snapshot.reason === 'loadedmetadata'
-+            || snapshot.reason === 'playing'
-+            || snapshot.reason === 'seeked'
-+        ) {
-+            this.scheduleResync(snapshot, effectiveTime);
-+        }
++        if (snapshot.reason !== 'frame') this.invalidate();
++        this.resize();
++        this.requestFrame();
 +    }
 +
 +    setOffset(offsetSeconds: number) {
++        if (this.offsetSeconds === offsetSeconds) return;
 +        this.offsetSeconds = offsetSeconds;
++        this.invalidate();
++    }
++
++    invalidate() {
++        this.epoch++;
 +        this.lastRenderedTime = undefined;
++        this.canvas.getContext('2d')?.clearRect(0, 0, this.canvas.width, this.canvas.height);
++    }
++
++    requestFrame() {
++        if (this.disposed || this.failed || this.pending || this.latestTime === undefined) return;
++        if (!this.videoElement.videoWidth || !this.videoElement.videoHeight
++            || !this.videoElement.offsetWidth || !this.videoElement.offsetHeight) return;
++        const minimumInterval = 1 / Math.max(1, this.options.targetFps || 24);
++        if (
++            this.lastRenderedTime !== undefined
++            && Math.abs(this.latestTime - this.lastRenderedTime) < minimumInterval
++        ) return;
++
++        // Coalesce clock updates behind one request. renderNow forces unchanged
++        // and empty frames too, without waiting for a new cue or a user seek.
++        const pending = { id: ++this.nextId, epoch: this.epoch, time: this.latestTime };
++        this.pending = pending;
++        if (this.activation && this.activationTimeout === undefined) {
++            this.activationTimeout = window.setTimeout(() => {
++                this.fail(new Error('ASS worker did not render a current frame within 10 seconds'));
++            }, 10_000);
++        }
++        this.frameTimeout = window.setTimeout(() => {
++            this.fail(new Error('ASS worker did not return a subtitle frame within 5 seconds'));
++        }, FRAME_TIMEOUT_MS);
++        this.worker.postMessage({
++            target: 'oneshot-render',
++            iteration: pending.id,
++            lastRendered: pending.time,
++            renderNow: true
++        });
++    }
++
++    onWorkerMessage = (event: MessageEvent<AssFrame>) => {
++        if (this.disposed || this.failed) return;
++        if (event.data.target !== 'canvas') {
++            this.renderer.onWorkerMessage(event);
++            return;
++        }
++        if (event.data.op !== 'oneshot-result') return;
++        const pending = this.pending;
++        if (!pending || pending.id !== event.data.iteration) return;
++        this.clearFrameTimeout();
++        this.pending = undefined;
++
++        try {
++            const current = pending.epoch === this.epoch;
++            const fresh = !this.activation
++                || Math.abs(pending.time - (this.latestTime ?? pending.time)) < 0.25;
++            if (current && fresh) {
++                this.paint(event.data);
++                this.lastRenderedTime = pending.time;
++                this.host.style.visibility = 'visible';
++                this.activation?.resolve();
++                this.activation = undefined;
++                this.clearActivationTimeout();
++            }
++            this.requestFrame();
++        } catch (error) {
++            this.fail(error);
++        }
++    };
++
++    paint(frame: AssFrame) {
++        const context = this.canvas.getContext('2d');
++        const bufferContext = this.bufferCanvas.getContext('2d');
++        if (!context || !bufferContext) throw new Error('Unable to create ASS canvas context');
++        context.clearRect(0, 0, this.canvas.width, this.canvas.height);
++        for (const part of frame.canvases) {
++            this.bufferCanvas.width = part.w;
++            this.bufferCanvas.height = part.h;
++            const imageData = bufferContext.createImageData(part.w, part.h);
++            imageData.data.set(new Uint8ClampedArray(part.buffer));
++            bufferContext.putImageData(imageData, 0, 0);
++            context.drawImage(this.bufferCanvas, part.x, part.y);
++        }
++    }
++
++    fail(error: unknown) {
++        if (this.disposed || this.failed) return;
++        this.failed = true;
++        this.clearFrameTimeout();
++        this.clearActivationTimeout();
++        if (this.activation) {
++            this.activation.reject(error);
++            this.activation = undefined;
++        } else {
++            // isCurrent() only describes loading. The pipeline checks the active
++            // generation itself, including while a replacement is loading.
++            this.options.onRuntimeFallbackRequested?.();
++            this.options.request.reportRuntimeError(error);
++        }
++    }
++
++    clearFrameTimeout() {
++        if (this.frameTimeout === undefined) return;
++        window.clearTimeout(this.frameTimeout);
++        this.frameTimeout = undefined;
++    }
++
++    clearActivationTimeout() {
++        if (this.activationTimeout === undefined) return;
++        window.clearTimeout(this.activationTimeout);
++        this.activationTimeout = undefined;
 +    }
 +
 +    dispose() {
 +        if (this.disposed) return;
 +        this.disposed = true;
 +        this.active = false;
++        this.activation?.reject(new Error('Subtitle load was cancelled'));
++        this.activation = undefined;
 +        this.resizeObserver?.disconnect();
-+        this.cancelResync();
++        this.clearFrameTimeout();
++        this.clearActivationTimeout();
++        this.worker.removeEventListener('message', this.onWorkerMessage);
 +        window.removeEventListener('resize', this.resize);
 +        document.removeEventListener('fullscreenchange', this.resize);
-+
 +        try {
-+            this.renderer.dispose();
++            if (this.renderer.worker) this.renderer.dispose();
 +        } finally {
 +            this.host.remove();
 +        }
 +    }
 +
-+    clearCanvas() {
-+        // Resetting the bitmap dimensions clears every previously painted ASS
-+        // frame even when libass has not produced a replacement frame yet.
-+        const { width, height } = this.canvas;
-+        this.canvas.width = width;
-+        this.canvas.height = height;
-+    }
-+
-+    cancelResync() {
-+        if (this.resyncFrameHandle === undefined) return;
-+        cancelAnimationFrame(this.resyncFrameHandle);
-+        this.resyncFrameHandle = undefined;
-+    }
-+
-+    scheduleResync(snapshot: SubtitleClockSnapshot, effectiveTime: number) {
-+        this.cancelResync();
-+        this.resyncFrameHandle = requestAnimationFrame(() => {
-+            this.resyncFrameHandle = undefined;
-+            if (this.disposed || !this.active) return;
-+
-+            this.lastRate = snapshot.playbackRate;
-+            this.lastPaused = snapshot.paused;
-+            this.lastRenderedTime = effectiveTime;
-+            this.renderer.setRate(snapshot.playbackRate);
-+            this.renderer.setIsPaused(snapshot.paused, effectiveTime);
-+            this.renderer.setCurrentTime(effectiveTime);
-+        });
-+    }
-+
 +    resize = () => {
 +        if (this.disposed || !this.active) return;
-+
 +        const videoWidth = this.videoElement.videoWidth;
 +        const videoHeight = this.videoElement.videoHeight;
 +        const elementWidth = this.videoElement.offsetWidth;
@@ -3647,49 +4126,64 @@ index 0000000000000000000000000000000000000000..5170653845f7fc69d9802291a16cd44b
 +            displayHeight = Math.floor(elementWidth / videoRatio);
 +        }
 +
-+        const x = (elementWidth - displayWidth) / 2;
-+        const y = (elementHeight - displayHeight) / 2;
 +        const hostOffset = this.host.getBoundingClientRect().top
 +            - this.videoElement.getBoundingClientRect().top;
-+        const pixelRatio = window.devicePixelRatio || 1;
-+
-+        this.canvas.style.display = 'block';
-+        this.canvas.style.position = 'absolute';
-+        this.canvas.style.width = `${displayWidth}px`;
-+        this.canvas.style.height = `${displayHeight}px`;
-+        this.canvas.style.top = `${y - hostOffset}px`;
-+        this.canvas.style.left = `${x}px`;
-+        this.canvas.style.pointerEvents = 'none';
-+        const renderSize = computeAssRenderSize(displayWidth, displayHeight, pixelRatio);
-+        this.renderer.resize(renderSize.width, renderSize.height);
++        Object.assign(this.canvas.style, {
++            display: 'block',
++            position: 'absolute',
++            width: `${displayWidth}px`,
++            height: `${displayHeight}px`,
++            top: `${(elementHeight - displayHeight) / 2 - hostOffset}px`,
++            left: `${(elementWidth - displayWidth) / 2}px`,
++            pointerEvents: 'none'
++        });
++        const size = computeAssRenderSize(displayWidth, displayHeight, window.devicePixelRatio || 1);
++        const width = Math.max(1, Math.floor(size.width));
++        const height = Math.max(1, Math.floor(size.height));
++        if (this.canvas.width !== width || this.canvas.height !== height) {
++            this.renderer.resize(width, height);
++            this.invalidate();
++            this.requestFrame();
++        }
 +    };
 +}
 +
-+export async function createAssRendererAdapter(options: AssRendererOptions) {
++export async function createAssRendererAdapter(options: AssRendererOptions): Promise<SubtitleRenderer> {
 +    const { default: SubtitlesOctopus } = await import('@jellyfin/libass-wasm') as {
 +        default: SubtitlesOctopusConstructor;
 +    };
-+
-+    if (!options.request.isCurrent()) {
-+        throw new Error('Subtitle load was cancelled');
-+    }
-+
++    if (!options.request.isCurrent()) throw new Error('Subtitle load was cancelled');
 +    const parentElement = options.videoElement.parentElement;
-+    if (!parentElement) {
-+        throw new Error('Unable to attach the ASS subtitle renderer');
++    if (!parentElement) throw new Error('Unable to attach the ASS subtitle renderer');
++
++    const primaryFonts = [ ...new Set(options.fonts) ];
++    const fallbackFonts = [ ...new Set(options.fallbackFonts || []) ];
++    const fontSets = [ primaryFonts ];
++    if (fallbackFonts.length && fallbackFonts.join('\n') !== primaryFonts.join('\n')) {
++        fontSets.push(fallbackFonts);
 +    }
 +
++    for (const fonts of fontSets) {
++        try {
++            return await prepareAssRenderer(SubtitlesOctopus, options, parentElement, fonts);
++        } catch (error) {
++            if (!options.request.isCurrent() || fonts === fontSets[fontSets.length - 1]) throw error;
++        }
++    }
++    throw new Error('Unable to initialize ASS subtitles');
++}
++
++function prepareAssRenderer(
++    SubtitlesOctopus: SubtitlesOctopusConstructor,
++    options: AssRendererOptions,
++    parentElement: HTMLElement,
++    fonts: string[]
++): Promise<SubtitleRenderer> {
 +    const host = document.createElement('div');
 +    host.classList.add('libassjs-canvas-parent', 'subtitle-pipeline-ass');
 +    Object.assign(host.style, {
-+        position: 'absolute',
-+        inset: '0',
-+        width: '100%',
-+        height: '100%',
-+        overflow: 'hidden',
-+        pointerEvents: 'none',
-+        visibility: 'hidden',
-+        zIndex: '1'
++        position: 'absolute', inset: '0', width: '100%', height: '100%',
++        overflow: 'hidden', pointerEvents: 'none', visibility: 'hidden', zIndex: '1'
 +    });
 +    const canvas = document.createElement('canvas');
 +    canvas.classList.add('libassjs-canvas');
@@ -3697,105 +4191,71 @@ index 0000000000000000000000000000000000000000..5170653845f7fc69d9802291a16cd44b
 +    parentElement.appendChild(host);
 +
 +    return new Promise<SubtitleRenderer>((resolve, reject) => {
-+        const primaryFonts = [ ...new Set(options.fonts) ];
-+        const fallbackFonts = [ ...new Set(options.fallbackFonts || []) ];
-+        const fontSets = [ primaryFonts ];
-+        if (fallbackFonts.length > 0 && fallbackFonts.join('\n') !== primaryFonts.join('\n')) {
-+            fontSets.push(fallbackFonts);
-+        }
-+
 +        let renderer: SubtitlesOctopusInstance | undefined;
-+        let fontSetIndex = 0;
++        let adapter: AssRendererAdapter | undefined;
 +        let settled = false;
-+        let readyTimeout: number | undefined;
 +        let unsubscribeCancel: () => void = () => undefined;
-+
-+        const clearReadyTimeout = () => {
-+            if (readyTimeout === undefined) return;
-+            window.clearTimeout(readyTimeout);
-+            readyTimeout = undefined;
++        const timeout = window.setTimeout(() => {
++            fail(new Error('ASS renderer did not finish loading subtitles and fonts within 30 seconds'));
++        }, RENDERER_READY_TIMEOUT_MS);
++        const cleanup = () => {
++            window.clearTimeout(timeout);
++            renderer?.worker?.removeEventListener('message', onMessage);
 +        };
-+
-+        const disposePending = () => {
-+            try {
-+                renderer?.dispose();
-+            } catch (error) {
-+                console.debug('Unable to dispose pending ASS renderer', error);
-+            }
-+            renderer = undefined;
-+        };
-+        const rejectOnce = (error: unknown) => {
-+            if (settled) return;
-+            settled = true;
-+            clearReadyTimeout();
-+            unsubscribeCancel();
-+            disposePending();
-+            host.remove();
-+            reject(error);
-+        };
-+        const onReady = () => {
-+            void Promise.resolve().then(() => {
-+                if (settled || !renderer || !options.request.isCurrent()) return;
-+
-+                const adapter = new AssRendererAdapter(options, host, canvas, renderer);
-+                settled = true;
-+                clearReadyTimeout();
-+                unsubscribeCancel();
-+                resolve(adapter);
-+            });
-+        };
-+        const onError = (error: unknown) => {
-+            if (!options.request.isCurrent()) return;
-+            if (settled) {
-+                options.onRuntimeFallbackRequested?.();
-+                options.request.reportRuntimeError(error);
++        const fail = (error: unknown) => {
++            if (adapter) {
++                adapter.fail(error);
 +                return;
 +            }
-+
-+            disposePending();
-+            clearReadyTimeout();
-+            fontSetIndex++;
-+            if (fontSetIndex < fontSets.length) {
-+                setTimeout(createRenderer, 0);
-+            } else {
-+                rejectOnce(error instanceof Error ? error : new Error('Unable to initialize ASS subtitles'));
-+            }
-+        };
-+        const createRenderer = () => {
-+            if (settled || !options.request.isCurrent()) return;
-+
++            if (settled) return;
++            settled = true;
++            cleanup();
++            unsubscribeCancel();
 +            try {
-+                renderer = new SubtitlesOctopus({
-+                    canvas,
-+                    subUrl: options.subtitleUrl,
-+                    fonts: fontSets[fontSetIndex] || [],
-+                    workerUrl: options.workerUrl,
-+                    legacyWorkerUrl: options.legacyWorkerUrl,
-+                    onReady,
-+                    onError,
-+                    renderMode: 'wasm-blend',
-+                    dropAllAnimations: false,
-+                    libassMemoryLimit: 40,
-+                    libassGlyphLimit: 40,
-+                    targetFps: options.targetFps,
-+                    prescaleFactor: PRESCALE_FACTOR,
-+                    prescaleHeightLimit: PRESCALE_HEIGHT_LIMIT,
-+                    maxRenderHeight: MAX_RENDER_HEIGHT,
-+                    resizeVariation: 0.2,
-+                    renderAhead: 0
-+                });
-+                readyTimeout = window.setTimeout(() => {
-+                    rejectOnce(new Error(`ASS renderer did not become ready within ${RENDERER_READY_TIMEOUT_MS / 1000} seconds.`));
-+                }, RENDERER_READY_TIMEOUT_MS);
-+            } catch (error) {
-+                rejectOnce(error);
++                if (renderer?.worker) renderer.dispose();
++            } finally {
++                host.remove();
++                reject(error);
 +            }
 +        };
-+
++        const onMessage = (event: MessageEvent) => {
++            if (settled || !renderer || event.data.target !== 'get-styles') return;
++            if (!options.request.isCurrent()) {
++                fail(new Error('Subtitle load was cancelled'));
++                return;
++            }
++            adapter = new AssRendererAdapter(options, host, canvas, renderer);
++            settled = true;
++            cleanup();
++            resolve(adapter);
++        };
 +        unsubscribeCancel = options.request.onCancel(() => {
-+            rejectOnce(new Error('Subtitle load was cancelled'));
++            if (adapter) adapter.dispose();
++            else fail(new Error('Subtitle load was cancelled'));
 +        });
-+        createRenderer();
++        try {
++            if (settled) return;
++            renderer = new SubtitlesOctopus({
++                canvas, subUrl: options.subtitleUrl, fonts,
++                workerUrl: options.workerUrl, legacyWorkerUrl: options.legacyWorkerUrl,
++                // Octopus disposes its worker immediately after this callback.
++                // Recover in the next microtask to avoid disposing it twice.
++                onError: (error: unknown) => { void Promise.resolve().then(() => fail(error)); },
++                renderMode: 'wasm-blend', dropAllAnimations: false,
++                libassMemoryLimit: 40, libassGlyphLimit: 40,
++                targetFps: options.targetFps, renderAhead: 0
++            });
++            if (settled) {
++                if (renderer.worker) renderer.dispose();
++                return;
++            }
++            renderer.worker.addEventListener('message', onMessage);
++            // Unlike onReady (the first worker message), this command is queued
++            // until WASM, ASS parsing and eager font loading have all completed.
++            renderer.worker.postMessage({ target: 'get-styles' });
++        } catch (error) {
++            fail(error);
++        }
 +    });
 +}
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer.test.ts b/src/plugins/htmlVideoPlayer/subtitles/renderers/TextEventRenderer.test.ts
@@ -4133,7 +4593,7 @@ index 0000000000000000000000000000000000000000..f6ed6789c0e2620388bd7fdade2584a1
 +}
 diff --git a/src/plugins/htmlVideoPlayer/subtitles/types.ts b/src/plugins/htmlVideoPlayer/subtitles/types.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..3997616c555fce4e3202d4612d45a86f327505ef
+index 0000000000000000000000000000000000000000..8cf4a5521257a0b254b13ca7d473ee2f5e6fc6ee
 --- /dev/null
 +++ b/src/plugins/htmlVideoPlayer/subtitles/types.ts
 @@ -0,0 +1,60 @@
@@ -4168,7 +4628,7 @@ index 0000000000000000000000000000000000000000..3997616c555fce4e3202d4612d45a86f
 +}
 +
 +export interface SubtitleRenderer {
-+    activate(snapshot: SubtitleClockSnapshot): void;
++    activate(snapshot: SubtitleClockSnapshot): void | Promise<void>;
 +    update(snapshot: SubtitleClockSnapshot): void;
 +    setOffset(offsetSeconds: number): void;
 +    dispose(): void;
@@ -4198,10 +4658,10 @@ index 0000000000000000000000000000000000000000..3997616c555fce4e3202d4612d45a86f
 +    Text?: string | null;
 +}
 diff --git a/src/styles/videoosd.scss b/src/styles/videoosd.scss
-index 9b7c25d8def0d1cf4986a6eeeeb0bddd32d2384f..db11b793ef280a1949fd2141f73ca18aff16c800 100644
+index 8b3de7c5313becb7017ddcb27d21d8f9ee8754c7..1ba6a1fa0a2261def2302fd4ca40cca856e07f2c 100644
 --- a/src/styles/videoosd.scss
 +++ b/src/styles/videoosd.scss
-@@ -112,6 +112,41 @@
+@@ -119,6 +119,41 @@
      opacity: 0;
  }
  

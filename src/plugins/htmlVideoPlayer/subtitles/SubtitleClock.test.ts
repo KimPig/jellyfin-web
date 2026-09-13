@@ -37,6 +37,43 @@ function createVideoFrameHarness() {
 }
 
 describe('SubtitleClock', () => {
+    it('recovers from waiting when decoded frames advance without another playing event', () => {
+        const harness = createVideoFrameHarness();
+        const clock = new SubtitleClock(harness.video);
+        Object.defineProperties(harness.video, {
+            currentTime: { configurable: true, writable: true, value: 1 },
+            readyState: { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA }
+        });
+        harness.video.dispatchEvent(new Event('waiting'));
+        clock.onVideoFrame(0, {} as VideoFrameCallbackMetadata);
+        expect(clock.snapshot().paused).toBe(true);
+        harness.video.currentTime = 2;
+        clock.onVideoFrame(1, {} as VideoFrameCallbackMetadata);
+        expect(clock.snapshot().paused).toBe(false);
+        clock.dispose();
+    });
+
+    it('uses timeupdate progress to recover on browsers without video frame callbacks', () => {
+        const video = document.createElement('video');
+        Object.defineProperties(video, {
+            paused: { configurable: true, value: false },
+            seeking: { configurable: true, writable: true, value: false },
+            currentTime: { configurable: true, writable: true, value: 1 },
+            readyState: { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA }
+        });
+        const clock = new SubtitleClock(video);
+        video.dispatchEvent(new Event('waiting'));
+        video.currentTime = 2;
+        video.dispatchEvent(new Event('timeupdate'));
+        expect(clock.snapshot().paused).toBe(false);
+        Object.defineProperty(video, 'seeking', { configurable: true, value: true });
+        video.dispatchEvent(new Event('seeking'));
+        video.currentTime = 10;
+        video.dispatchEvent(new Event('timeupdate'));
+        expect(clock.snapshot().paused).toBe(true);
+        clock.dispose();
+    });
+
     it('cancels and rearms video-frame callbacks across repeated media sources', () => {
         const harness = createVideoFrameHarness();
         const clock = new SubtitleClock(harness.video);

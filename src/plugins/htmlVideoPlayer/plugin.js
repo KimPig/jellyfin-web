@@ -51,7 +51,7 @@ const ASS_SUBTITLE_CODECS = ['ssa', 'ass'];
 const SRT_SUBTITLE_CODECS = ['srt', 'subrip'];
 const VOBSUB_SUBTITLE_CODECS = ['dvdsub', 'vobsub'];
 const BITMAP_SUBTITLE_ASPECT_MODES = ['stretch', 'contain', 'cover'];
-const PLAYBACK_DIAGNOSTIC_VERSION = '2026-08-18.4';
+const PLAYBACK_DIAGNOSTIC_VERSION = '2026-09-14.1';
 const PLAYBACK_DIAGNOSTIC_EVENTS = [
     'loadstart',
     'loadedmetadata',

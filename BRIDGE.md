@@ -46,6 +46,20 @@ the workflow.
 
 ## Updating the compatibility patch
 
+The current source base is official `v12.0`. Patch `20260914.1` waits for
+libass track/font initialization and the first rendered frame before replacing
+the previous subtitle. It uses the pinned libass worker's timestamped
+`oneshot-render` protocol, with no render-ahead cache or independent worker clock.
+Late frames from before a seek/resize are discarded. A stalled worker is retried
+once, and clock progress can recover buffering without a second `playing` event.
+
+`scripts/test-ass-browser.mjs` exercises the real WASM and legacy workers in
+headless Chromium with delayed ASS/font responses. It checks canvas pixels
+without taking screenshots. It requires `ffmpeg` and Playwright 1.63.0; install
+Playwright outside the project and set `PLAYWRIGHT_MODULE` to its `index.mjs`
+path. `CHROMIUM_EXECUTABLE` optionally selects an existing Chromium executable.
+The release workflow runs this test before building production assets.
+
 `patches/upstream-base.txt` records the official tag from which the current
 source changes were developed. After changing an enhancement, regenerate the
 patch from the repository root:

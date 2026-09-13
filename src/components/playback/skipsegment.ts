@@ -11,6 +11,7 @@ import dom from 'utils/dom';
 import globalize from 'lib/globalize';
 import focusManager from 'components/focusManager';
 import layoutManager from 'components/layoutManager';
+import ResizeObserver from 'resize-observer-polyfill';
 
 interface ShowOptions {
     animate?: boolean;

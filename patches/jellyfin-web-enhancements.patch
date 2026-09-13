@@ -766,18 +766,21 @@ index 86540c68409736ce5550f2eab644f2a1769fb277..aef85487d2a287a5f57549e0565a641b
  
  .skip-button {
 diff --git a/src/components/playback/skipsegment.ts b/src/components/playback/skipsegment.ts
-index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..1c14e3806f40570cacfba626a0929242a4c76602 100644
+index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..02c3fc61d5cf1338cbfd9fe25340056141e7a21f 100644
 --- a/src/components/playback/skipsegment.ts
 +++ b/src/components/playback/skipsegment.ts
-@@ -9,7 +9,6 @@ import { EventType } from 'constants/eventType';
+@@ -9,9 +9,9 @@ import { EventType } from 'constants/eventType';
  import './skipbutton.scss';
  import dom from 'utils/dom';
  import globalize from 'lib/globalize';
 -import * as userSettings from 'scripts/settings/userSettings';
  import focusManager from 'components/focusManager';
  import layoutManager from 'components/layoutManager';
++import ResizeObserver from 'resize-observer-polyfill';
  
-@@ -38,12 +37,16 @@ class SkipSegment extends PlaybackSubscriber {
+ interface ShowOptions {
+     animate?: boolean;
+@@ -38,12 +38,16 @@ class SkipSegment extends PlaybackSubscriber {
      private skipElement: HTMLButtonElement | null;
      private currentSegment: MediaSegmentDto | null | undefined;
      private hideTimeout: ReturnType<typeof setTimeout> | null | undefined;
@@ -794,7 +797,7 @@ index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..1c14e3806f40570cacfba626a0929242
      }
  
      createSkipElement() {
-@@ -67,10 +70,64 @@ class SkipSegment extends PlaybackSubscriber {
+@@ -67,10 +71,64 @@ class SkipSegment extends PlaybackSubscriber {
                          }
                      }
                  });
@@ -859,7 +862,7 @@ index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..1c14e3806f40570cacfba626a0929242
      setButtonText() {
          if (this.skipElement && this.currentSegment) {
              this.skipElement.innerHTML = globalize.translate('MediaSegmentSkipPrompt', globalize.translate(`MediaSegmentType.${this.currentSegment.Type}`));
-@@ -101,6 +158,7 @@ class SkipSegment extends PlaybackSubscriber {
+@@ -101,6 +159,7 @@ class SkipSegment extends PlaybackSubscriber {
              }
  
              requestAnimationFrame(() => {
@@ -867,7 +870,7 @@ index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..1c14e3806f40570cacfba626a0929242
                  elem.classList.remove('skip-button-hidden');
  
                  if (!options.keep) {
-@@ -149,14 +207,6 @@ class SkipSegment extends PlaybackSubscriber {
+@@ -149,14 +208,6 @@ class SkipSegment extends PlaybackSubscriber {
      }
  
      onPromptSkip(e: Event, segment: MediaSegmentDto) {
@@ -882,7 +885,7 @@ index ae7b43fa6e5a9109c6614b479adc54d69d5abddf..1c14e3806f40570cacfba626a0929242
          if (!this.currentSegment) {
              this.currentSegment = segment;
  
-@@ -186,6 +236,7 @@ class SkipSegment extends PlaybackSubscriber {
+@@ -186,6 +237,7 @@ class SkipSegment extends PlaybackSubscriber {
          if (this.playbackManager.getCurrentPlayer()) {
              Events.off(document, EventType.SHOW_VIDEO_OSD, this.onOsdChanged);
              Events.on(document, EventType.SHOW_VIDEO_OSD, this.onOsdChanged);

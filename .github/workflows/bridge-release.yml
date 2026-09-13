@@ -101,6 +101,7 @@ jobs:
             src/plugins/htmlVideoPlayer/subtitles \
             src/utils/subtitleFontBridgeResolver.test.ts
           npx eslint \
+            src/components/playback/skipsegment.ts \
             src/plugins/htmlVideoPlayer/plugin.js \
             src/plugins/htmlVideoPlayer/subtitleFontBridgeResolver.ts \
             "src/plugins/htmlVideoPlayer/subtitles/**/*.ts" \
